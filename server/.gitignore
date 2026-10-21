@@ -1,0 +1,6 @@
+.env
+.env.*
+!.env.example
+service-account*.json
+firebase-admin-key*.json
+.firebase/

@@ -1,0 +1,59 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function isMember(groupId) {
+      return signedIn() && exists(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid));
+    }
+    function isSelf(uid) { return signedIn() && request.auth.uid == uid; }
+    function hasFamilyAccess() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/familyAccessSessions/$(request.auth.uid))
+        && get(/databases/$(database)/documents/familyAccessSessions/$(request.auth.uid)).data.active == true
+        && get(/databases/$(database)/documents/familyAccessSessions/$(request.auth.uid)).data.expiresAt is timestamp
+        && get(/databases/$(database)/documents/familyAccessSessions/$(request.auth.uid)).data.expiresAt > request.time;
+    }
+
+    match /users/{uid} {
+      allow create: if isSelf(uid) && hasFamilyAccess() && request.resource.data.keys().hasOnly(['displayName', 'email', 'createdAt']);
+      allow read: if isSelf(uid) && hasFamilyAccess();
+      allow update: if isSelf(uid) && hasFamilyAccess() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName', 'photoURL']);
+      allow delete: if false;
+    }
+
+    match /groups/{groupId} {
+      allow read: if hasFamilyAccess() && isMember(groupId);
+      allow write: if false;
+      match /members/{uid} {
+        allow read: if hasFamilyAccess() && isMember(groupId);
+        allow write: if false; // Membership is granted by trusted administrative setup.
+      }
+    }
+
+    match /messages/{messageId} {
+      allow read: if hasFamilyAccess() && isMember(resource.data.groupId);
+      allow create: if hasFamilyAccess()
+        && request.resource.data.senderId == request.auth.uid
+        && request.resource.data.groupId is string
+        && isMember(request.resource.data.groupId)
+        && request.resource.data.text is string
+        && request.resource.data.text.size() > 0
+        && request.resource.data.text.size() <= 4000
+        && request.resource.data.keys().hasOnly(['groupId', 'text', 'senderId', 'senderName', 'createdAt', 'forwarded', 'forwardedFrom']);
+      allow update, delete: if false;
+    }
+
+    match /groups/{groupId}/locations/{uid} {
+      allow read: if hasFamilyAccess() && isMember(groupId);
+      allow create, update: if hasFamilyAccess() && isSelf(uid)
+        && isMember(groupId)
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.latitude is number
+        && request.resource.data.longitude is number
+        && request.resource.data.latitude >= -90 && request.resource.data.latitude <= 90
+        && request.resource.data.longitude >= -180 && request.resource.data.longitude <= 180
+        && request.resource.data.keys().hasOnly(['uid', 'displayName', 'latitude', 'longitude', 'accuracy', 'speed', 'updatedAt', 'online', 'vehicle']);
+      allow delete: if hasFamilyAccess() && isSelf(uid);
+    }
+  }
+}

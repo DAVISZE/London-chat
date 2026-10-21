@@ -1,0 +1,11 @@
+{
+  "name": "London Family Tracker",
+  "short_name": "London Family",
+  "description": "Um ponto de encontro seguro para a viagem da família a Londres.",
+  "lang": "pt-BR",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#171a27",
+  "theme_color": "#171a27",
+  "icons": [{ "src": "./icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
