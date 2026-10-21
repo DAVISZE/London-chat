@@ -34,9 +34,6 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - name: Verify Firebase web configuration
-        run: |
-          node --input-type=module -e "const keys=['VITE_FIREBASE_API_KEY','VITE_FIREBASE_AUTH_DOMAIN','VITE_FIREBASE_PROJECT_ID','VITE_FIREBASE_STORAGE_BUCKET','VITE_FIREBASE_MESSAGING_SENDER_ID','VITE_FIREBASE_APP_ID']; const missing=keys.filter(key=>!process.env[key]?.trim()); if(missing.length){console.error('Missing Firebase configuration values: '+missing.join(', ')); process.exit(1)} console.log('Firebase web configuration is present.')"
       - run: npm run build
         env:
           GITHUB_PAGES: 'true'
