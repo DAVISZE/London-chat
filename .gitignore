@@ -8,3 +8,4 @@ firebase-admin-key*.json
 server/.env
 server/.env.*
 !server/.env.example
+/local-user-admin-java/

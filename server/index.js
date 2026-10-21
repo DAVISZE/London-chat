@@ -16,6 +16,7 @@ const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 const RATE_WINDOW_MS = 15 * 60 * 1000;
 const USER_ATTEMPT_LIMIT = 5;
 const IP_ATTEMPT_LIMIT = 20;
+const deletionNoticeAttempts = new Map();
 const FAMILY_GROUPS = [
   ['familia', 'Família'], ['carro-1', 'Carro 1'], ['carro-2', 'Carro 2'], ['voo', 'Voo'], ['chateiros', 'Chateiros'],
 ];
@@ -191,6 +192,34 @@ function firebaseAdmin() {
 app.get('/health', (_req, res) => {
   const missing = missingEnvironment();
   res.status(missing.length ? 503 : 200).json({ status: missing.length ? 'needs_configuration' : 'ok', missing });
+});
+
+app.post('/api/account-deletion-status', async (req, res) => {
+  if (!originAllowed(req)) return res.status(403).json({ error: 'Request origin is not allowed.' });
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  if (!email || email.length > 320 || !email.includes('@')) return res.status(400).json({ deleted: false });
+  const now = Date.now();
+  const key = req.ip || 'unknown';
+  const attempt = deletionNoticeAttempts.get(key) || { count: 0, resetAt: now + 10 * 60 * 1000 };
+  if (attempt.resetAt <= now) { attempt.count = 0; attempt.resetAt = now + 10 * 60 * 1000; }
+  attempt.count += 1;
+  deletionNoticeAttempts.set(key, attempt);
+  if (attempt.count > 20) return res.status(429).json({ deleted: false });
+  try {
+    const digest = createHash('sha256').update(email, 'utf8').digest('hex');
+    try {
+      await firebaseAdmin().auth().getUserByEmail(email);
+      res.set('Cache-Control', 'no-store');
+      return res.json({ deleted: false });
+    } catch (error) {
+      if (error?.code !== 'auth/user-not-found') throw error;
+    }
+    const notice = await firebaseAdmin().firestore().doc(`accountDeletionNotices/${digest}`).get();
+    res.set('Cache-Control', 'no-store');
+    return res.json({ deleted: notice.exists });
+  } catch {
+    return res.status(503).json({ deleted: false });
+  }
 });
 
 app.get('/api/family/session', async (req, res) => {

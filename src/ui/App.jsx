@@ -163,7 +163,16 @@ export default function App() {
         const result = await createUserWithEmailAndPassword(auth, credentials.email, credentials.password);
         await updateProfile(result.user, { displayName: credentials.name });
       } else await signInWithEmailAndPassword(auth, credentials.email, credentials.password);
-    } catch (e) { setError(e.code === 'auth/invalid-credential' ? 'E-mail ou senha incorretos.' : e.message); }
+    } catch (e) {
+      if (authMode === 'login' && ['auth/invalid-credential', 'auth/user-not-found'].includes(e.code)) {
+        try {
+          const response = await fetch(`${import.meta.env.VITE_API_BASE_URL || ''}/api/account-deletion-status`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: credentials.email }) });
+          const result = await response.json().catch(() => ({}));
+          if (response.ok && result.deleted) { setError('Sua conta foi deletada pelo ADMIN.'); return; }
+        } catch { /* Login mantém a mensagem genérica se o servidor estiver indisponível. */ }
+      }
+      setError(['auth/invalid-credential', 'auth/user-not-found'].includes(e.code) ? 'E-mail ou senha incorretos.' : e.message);
+    }
   }
 
   async function enterFamilyAccess(event) {
