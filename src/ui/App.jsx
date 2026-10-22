@@ -113,11 +113,21 @@ export default function App() {
       if (document.visibilityState === 'visible') acquireWakeLock();
       else if (sentinel) setWakeLockStatus('inactive');
     };
+    // Some mobile browsers require a user gesture before granting a screen
+    // wake lock. Retry on the first interaction, and expose an explicit retry
+    // button in the navigation rail for iPhone users.
+    const onUserGesture = () => acquireWakeLock();
     document.addEventListener('visibilitychange', onVisibilityChange);
+    document.addEventListener('pointerdown', onUserGesture, { capture: true, passive: true });
+    document.addEventListener('keydown', onUserGesture, { capture: true });
+    window.addEventListener('lft:request-screen-wake-lock', onUserGesture);
     acquireWakeLock();
     return () => {
       disposed = true;
       document.removeEventListener('visibilitychange', onVisibilityChange);
+      document.removeEventListener('pointerdown', onUserGesture, { capture: true });
+      document.removeEventListener('keydown', onUserGesture, { capture: true });
+      window.removeEventListener('lft:request-screen-wake-lock', onUserGesture);
       const lock = sentinel;
       sentinel = null;
       if (lock && !lock.released) lock.release().catch(() => {});
@@ -326,7 +336,7 @@ export default function App() {
       <button className="rail-icon" title="Conversas" onClick={() => { setMenuOpen(true); window.setTimeout(() => document.querySelector('.chat-card')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 280); }} aria-label="Conversas"><MessageCircle size={18} /></button>
       <div className="rail-spacer" />
       <button className="rail-icon" title="Privacidade" aria-label="Privacidade" onClick={() => setActivePanel('privacy')}><ShieldCheck size={18} /></button>
-      <span className={`rail-icon wake-lock-indicator ${wakeLockStatus}`} role="status" aria-label={wakeLockStatus === 'active' ? 'Tela mantida ativa' : wakeLockStatus === 'unsupported' ? 'Este navegador não oferece bloqueio de tela' : wakeLockStatus === 'requesting' ? 'Solicitando tela ativa' : 'Bloqueio de tela indisponível'} title={wakeLockStatus === 'active' ? 'Tela mantida ativa enquanto o site estiver visível' : wakeLockStatus === 'unsupported' ? 'Bloqueio de tela não suportado neste navegador' : wakeLockStatus === 'requesting' ? 'Tentando manter a tela ativa' : 'O dispositivo liberou ou não permitiu o bloqueio de tela'}><Sun size={18} /></span>
+      <button type="button" className={`rail-icon wake-lock-indicator ${wakeLockStatus}`} onClick={() => window.dispatchEvent(new Event('lft:request-screen-wake-lock'))} aria-label={wakeLockStatus === 'active' ? 'Tela mantida ativa. Toque para tentar novamente' : wakeLockStatus === 'unsupported' ? 'Este navegador não oferece bloqueio de tela' : 'Toque para tentar manter a tela ativa'} title={wakeLockStatus === 'active' ? 'Tela mantida ativa enquanto o site estiver visível' : wakeLockStatus === 'unsupported' ? 'Bloqueio de tela não suportado neste navegador' : wakeLockStatus === 'requesting' ? 'Tentando manter a tela ativa' : 'Toque para tentar manter a tela ativa'}><Sun size={18} /></button>
       <button className="rail-icon" title="Sair" onClick={exitAccount} aria-label="Sair"><LogOut size={18} /></button>
       <div className="rail-avatar">{(familyName || user.displayName || 'F')[0].toUpperCase()}<i /></div>
     </nav>

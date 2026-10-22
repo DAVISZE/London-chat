@@ -82,12 +82,18 @@ async function authenticatedUser(req) {
 
 async function sessionIsActive(req, uid) {
   const cookie = familyCookie(req);
-  if (!cookie || cookie.uid !== uid) return false;
+  // GitHub Pages and Render are different sites. Safari's privacy protections
+  // may omit the HttpOnly cross-site cookie even when fetch uses credentials.
+  // The Firebase ID token has already been verified by each caller; bind the
+  // session to that unguessable anonymous UID and the active server-side record
+  // as a fallback. When the cookie is present, continue to verify its hash.
+  if (cookie && cookie.uid !== uid) return false;
   const record = await firebaseAdmin().firestore().doc(`familyAccessSessions/${uid}`).get();
   if (!record.exists) return false;
   const data = record.data();
-  return data.active === true && data.sessionHash === sessionHash(cookie.sid)
-    && data.expiresAt?.toMillis?.() > Date.now();
+  const expiresAt = data.expiresAt?.toMillis?.();
+  if (data.active !== true || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) return false;
+  return !cookie || data.sessionHash === sessionHash(cookie.sid);
 }
 
 function rateKey(value) {
@@ -298,7 +304,7 @@ app.post('/api/family/session/end', async (req, res) => {
   if (!user) return res.status(401).json({ error: 'Individual sign-in is required.' });
   try {
     const cookie = familyCookie(req);
-    if (cookie?.uid === user.uid) {
+    if (cookie?.uid === user.uid || await sessionIsActive(req, user.uid)) {
       await firebaseAdmin().firestore().doc(`familyAccessSessions/${user.uid}`).set({ active: false, expiresAt: admin.firestore.Timestamp.fromMillis(Date.now()), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
     }
     clearFamilyCookie(res);
