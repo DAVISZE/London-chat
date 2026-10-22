@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: london-family-tracker-api
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm run server
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FIREBASE_PROJECT_ID
+        value: projetoimprimir-2f58d
+      - key: ALLOWED_ORIGINS
+        value: https://davisze.github.io
+      - key: FAMILY_SESSION_SECRET
+        generateValue: true
+      - key: FAMILY_ACCESS_PASSWORD
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
