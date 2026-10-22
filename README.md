@@ -14,7 +14,7 @@ npm run dev
 
 Preencha o `.env` com o `firebaseConfig` do aplicativo Web no Console Firebase. Os campos `VITE_*` são configurações públicas do cliente Firebase, não chaves administrativas. Nunca coloque service account, segredo LiveKit ou token de acesso no `.env` do frontend.
 
-Para o login funcionar, habilite **Authentication → Sign-in method → Email/Password** e crie um banco **Cloud Firestore**. Aplique as regras e índices:
+Para entrar, habilite **Authentication → Sign-in method → Anonymous** e crie um banco **Cloud Firestore**. A tela pede primeiro só a senha familiar; quando ela for aceita, pede o nome. O Firebase cria uma identidade anônima temporária, sem e-mail ou conta individual. A senha continua sendo validada pelo backend e protegida por limite de tentativas. Aplique as regras e índices:
 
 ```sh
 npx firebase-tools login
@@ -22,7 +22,7 @@ npx firebase-tools use <PROJECT_ID>
 npx firebase-tools deploy --only firestore:rules,firestore:indexes
 ```
 
-Cada pessoa entra com uma conta individual do Firebase Authentication e, depois, valida a senha da família. Nesse momento o backend confiável cria/atualiza os cinco grupos e associa somente a conta autenticada que acabou de validar a senha. A gravação do acesso e das associações é atômica e usa Firebase Admin; o navegador não pode editar membros. Não é necessário rodar `seed:groups` para o fluxo normal.
+Depois que a pessoa informa a senha e o nome, o backend valida o acesso, cria a sessão e associa a identidade anônima aos cinco grupos usando Firebase Admin. O navegador não pode editar membros. Não é necessário rodar `seed:groups` para o fluxo normal. Como a identidade é temporária, o nome digitado identifica as mensagens e localizações, mas não comprova a identidade civil da pessoa.
 
 ## Áudio LiveKit
 
@@ -49,7 +49,7 @@ Autenticação do Firebase Admin deve usar a identidade de serviço gerenciada d
 
 Rode o backend com `npm run server` (porta 3000) e o frontend com `npm run dev`. O proxy de desenvolvimento cobre `/api` quando `VITE_API_BASE_URL` estiver vazio; alternativamente, configure `VITE_API_BASE_URL=http://localhost:3000` no `.env` da raiz. Para produção, configure a URL pública do backend como variável `VITE_API_BASE_URL` no GitHub Actions. Em hospedagem separada, cadastre a origem exata do site em `ALLOWED_ORIGINS` no ambiente privado do backend. Para iPhone/Safari, prefira frontend e API em subdomínios do mesmo domínio personalizado; políticas contra cookies de terceiros podem bloquear sessões entre `github.io` e o domínio do backend.
 
-Verifique a configuração sem revelar valores em `http://localhost:3000/health`: retorna `status: "ok"` quando está pronta ou uma lista `missing` com apenas os nomes das variáveis ausentes. Para testar, faça login com a conta Firebase e tente primeiro uma senha errada (mensagem genérica), depois a senha definida localmente; o painel da viagem só aparece após os dois passos. Confira que o arquivo local continua ignorado com `git check-ignore server/.env` depois de inicializar/clonar o repositório.
+Verifique a configuração sem revelar valores em `http://localhost:3000/health`: retorna `status: "ok"` quando está pronta ou uma lista `missing` com apenas os nomes das variáveis ausentes. Para testar, tente primeiro uma senha errada; depois entre com a senha correta e informe seu nome quando solicitado. Confira que o arquivo local continua ignorado com `git check-ignore server/.env` depois de inicializar/clonar o repositório.
 
 ## Publicar no GitHub Pages
 
@@ -63,7 +63,7 @@ O PWA funciona em primeiro plano. No iPhone, instale pelo Safari usando **Compar
 
 ## Estado desta entrega
 
-- **Preparado e implementado no frontend:** layout responsivo/PWA, mapa OSM escuro, autenticação por e-mail/senha, mensagens Firestore em tempo real, encaminhamento para Chateiros, seletor de grupo e consentimento explícito para compartilhar posição atual. O mapa só cria marcadores a partir de documentos reais autorizados no Firestore; sem documentos, não inventa posições.
+- **Preparado e implementado no frontend:** layout responsivo/PWA, mapa OSM escuro, entrada com senha compartilhada e nome usando identidade anônima do Firebase, mensagens Firestore em tempo real, encaminhamento para Chateiros, seletor de grupo e consentimento explícito para compartilhar posição atual. O mapa só cria marcadores a partir de documentos reais autorizados no Firestore; sem documentos, não inventa posições.
 - **Preparado, depende de credenciais/infraestrutura:** conectar Firebase, aplicar regras, formar grupos, servir o backend autenticado, preencher a senha familiar em `server/.env` e configurar LiveKit. Sem isso, chamadas não conectam.
 - **Ainda por implementar:** notificações FCM completas, convites/permissões administrativas dentro do produto, tela de detalhes para voo, limpeza/expiração automática de localização e testes reais de chamada em iPhone e redes 4G/5G. O estado online atual é o último registro enviado, não um sinal confiável de presença em segundo plano.
 

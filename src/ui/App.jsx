@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { onAuthStateChanged, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, updateProfile } from 'firebase/auth';
-import { addDoc, collection, doc, getDoc, limit, onSnapshot, query, serverTimestamp, setDoc, where } from 'firebase/firestore';
+import { inMemoryPersistence, onAuthStateChanged, setPersistence, signInAnonymously, signOut, updateProfile } from 'firebase/auth';
+import { addDoc, collection, doc, limit, onSnapshot, query, serverTimestamp, setDoc, where } from 'firebase/firestore';
 import { Room, RoomEvent, Track } from 'livekit-client';
-import { Activity, ArrowRight, Bell, CarFront, Check, ChevronDown, CircleHelp, Compass, Crosshair, Eye, EyeOff, Forward, KeyRound, LogIn, LogOut, LockKeyhole, MapPin, Menu, MessageCircle, Mic, MicOff, Navigation, Phone, Plane, Send, ShieldCheck, SignalHigh, Sun, Users, X } from 'lucide-react';
+import { Activity, ArrowRight, Bell, CarFront, Check, ChevronDown, CircleHelp, Compass, Crosshair, Eye, EyeOff, Forward, LogIn, LogOut, LockKeyhole, MapPin, Menu, MessageCircle, Mic, MicOff, Navigation, Phone, Plane, Send, ShieldCheck, SignalHigh, Sun, Users, X } from 'lucide-react';
 import { auth, db, firebaseConfigured } from '../firebase.js';
 import MapView from './MapView.jsx';
 
@@ -13,6 +13,12 @@ const GROUPS = [
   { id: 'voo', name: 'Voo', icon: Plane, color: '#f5bd69', text: 'Acompanhamento do voo' },
   { id: 'chateiros', name: 'Chateiros', icon: MessageCircle, color: '#e08cb5', text: 'A central da família' },
 ];
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
+const API_NOT_CONFIGURED = 'O servidor seguro ainda não está conectado. Configure a URL HTTPS do backend em VITE_API_BASE_URL e publique o site novamente.';
+function backendUrl(path) {
+  if (import.meta.env.PROD && !API_BASE_URL) throw new Error(API_NOT_CONFIGURED);
+  return `${API_BASE_URL}${path}`;
+}
 
 function timeLabel(value) {
   if (!value) return 'agora';
@@ -37,9 +43,7 @@ export default function App() {
   const [familyAccess, setFamilyAccess] = useState('checking');
   const [familyAccessEndsAt, setFamilyAccessEndsAt] = useState(0);
   const [familyPassword, setFamilyPassword] = useState('');
-  const [showFamilyPassword, setShowFamilyPassword] = useState(false);
   const [familyAccessBusy, setFamilyAccessBusy] = useState(false);
-  const [familyAccessError, setFamilyAccessError] = useState('');
   const [active, setActive] = useState('familia');
   const [messages, setMessages] = useState([]);
   const [members, setMembers] = useState([]);
@@ -55,8 +59,9 @@ export default function App() {
   const [vehicleRole, setVehicleRole] = useState('pessoa');
   const [speakers, setSpeakers] = useState([]);
   const [menuOpen, setMenuOpen] = useState(false);
-  const [authMode, setAuthMode] = useState('login');
-  const [credentials, setCredentials] = useState({ name: '', email: '', password: '' });
+  const [credentials, setCredentials] = useState({ name: '' });
+  const [authPasswordVisible, setAuthPasswordVisible] = useState(false);
+  const [familyName, setFamilyName] = useState('');
   const [remoteAudio, setRemoteAudio] = useState([]);
   const [wakeLockStatus, setWakeLockStatus] = useState('requesting');
   const [activePanel, setActivePanel] = useState(null);
@@ -67,7 +72,18 @@ export default function App() {
 
   useEffect(() => {
     if (!firebaseConfigured) { setAuthReady(true); return; }
-    return onAuthStateChanged(auth, current => { setUser(current); setAuthReady(true); });
+    let unsubscribe;
+    let cancelled = false;
+    // This app uses a shared family password, not persistent personal accounts.
+    // Keep Firebase's anonymous identity only in memory so a reload asks again.
+    setPersistence(auth, inMemoryPersistence)
+      .then(() => signOut(auth))
+      .then(() => {
+        if (cancelled) return;
+        unsubscribe = onAuthStateChanged(auth, current => { setUser(current); setAuthReady(true); });
+      })
+      .catch(() => { if (!cancelled) setAuthReady(true); });
+    return () => { cancelled = true; unsubscribe?.(); };
   }, []);
 
   useEffect(() => {
@@ -108,21 +124,13 @@ export default function App() {
     };
   }, []);
 
-  useEffect(() => {
-    if (!user) { setFamilyAccess('locked'); return; }
-    let cancelled = false;
-    setFamilyAccess('checking');
-    user.getIdToken().then(idToken => fetch(`${import.meta.env.VITE_API_BASE_URL || ''}/api/family/session`, { credentials: 'include', headers: { Authorization: `Bearer ${idToken}` } }))
-      .then(async response => { const payload = await response.json().catch(() => ({})); if (!cancelled) { setFamilyAccess(response.ok ? 'unlocked' : 'locked'); setFamilyAccessEndsAt(response.ok ? payload.expiresAt || 0 : 0); } })
-      .catch(() => { if (!cancelled) { setFamilyAccess('locked'); setFamilyAccessError('Não foi possível verificar o acesso agora. Tente novamente.'); } });
-    return () => { cancelled = true; };
-  }, [user]);
+  useEffect(() => { if (!user) { setFamilyAccess('locked'); setFamilyName(''); } }, [user]);
 
   useEffect(() => {
     if (familyAccess !== 'unlocked' || !familyAccessEndsAt) return;
     const remaining = familyAccessEndsAt - Date.now();
-    if (remaining <= 0) { setFamilyAccess('locked'); setFamilyAccessError('Sua sessão expirou. Entre novamente com a senha da família.'); return; }
-    const timeout = window.setTimeout(() => { setFamilyAccess('locked'); setFamilyAccessError('Sua sessão expirou. Entre novamente com a senha da família.'); }, remaining);
+    if (remaining <= 0) { setFamilyAccess('locked'); signOut(auth); return; }
+    const timeout = window.setTimeout(() => { setFamilyAccess('locked'); signOut(auth); }, remaining);
     return () => window.clearTimeout(timeout);
   }, [familyAccess, familyAccessEndsAt]);
 
@@ -158,45 +166,58 @@ export default function App() {
 
   async function authenticate(event) {
     event.preventDefault(); setError('');
+    if (!familyPassword) { setError('Digite a senha da família.'); return; }
+    let anonymousUser = null;
+    setFamilyAccessBusy(true);
     try {
-      if (authMode === 'signup') {
-        const result = await createUserWithEmailAndPassword(auth, credentials.email, credentials.password);
-        await updateProfile(result.user, { displayName: credentials.name });
-      } else await signInWithEmailAndPassword(auth, credentials.email, credentials.password);
-    } catch (e) {
-      if (authMode === 'login' && ['auth/invalid-credential', 'auth/user-not-found'].includes(e.code)) {
-        try {
-          const response = await fetch(`${import.meta.env.VITE_API_BASE_URL || ''}/api/account-deletion-status`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: credentials.email }) });
-          const result = await response.json().catch(() => ({}));
-          if (response.ok && result.deleted) { setError('Sua conta foi deletada pelo ADMIN.'); return; }
-        } catch { /* Login mantém a mensagem genérica se o servidor estiver indisponível. */ }
-      }
-      setError(['auth/invalid-credential', 'auth/user-not-found'].includes(e.code) ? 'E-mail ou senha incorretos.' : e.message);
-    }
-  }
-
-  async function enterFamilyAccess(event) {
-    event.preventDefault();
-    if (!user || !familyPassword || familyAccessBusy) return;
-    setFamilyAccessBusy(true); setFamilyAccessError('');
-    try {
-      const idToken = await user.getIdToken();
-      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL || ''}/api/family/access`, { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` }, body: JSON.stringify({ password: familyPassword }) });
+      setFamilyAccess('checking');
+      const result = await signInAnonymously(auth);
+      anonymousUser = result.user;
+      const idToken = await anonymousUser.getIdToken();
+      const response = await fetch(backendUrl('/api/family/access'), {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+        body: JSON.stringify({ password: familyPassword }),
+      });
       const payload = await response.json().catch(() => ({}));
-      setFamilyPassword('');
       if (!response.ok) {
-        if (payload.code === 'FAMILY_PASSWORD_INCORRECT') throw new Error('A senha da família está incorreta. Tente novamente.');
-        if (payload.code === 'FIREBASE_ADMIN_AUTH_UNAVAILABLE') throw new Error(payload.error);
-        if (payload.code === 'AUTH_REQUIRED') throw new Error('Sua sessão individual expirou. Saia e entre novamente.');
+        if (payload.code === 'FAMILY_PASSWORD_INCORRECT') throw new Error('Senha da família incorreta. Confira e tente de novo.');
         if (response.status === 429) throw new Error('Muitas tentativas. Aguarde 15 minutos antes de tentar novamente.');
-        if (response.status === 503) throw new Error(`A proteção ainda precisa de configuração no servidor: ${(payload.missing || []).join(', ')}.`);
+        if (response.status === 503) throw new Error(`O servidor precisa de configuração: ${(payload.missing || []).join(', ')}.`);
         throw new Error(payload.error || 'Não foi possível liberar o acesso agora.');
       }
-      const profileRef = doc(db, 'users', user.uid);
-      if (!(await getDoc(profileRef)).exists()) await setDoc(profileRef, { displayName: user.displayName || user.email.split('@')[0], email: user.email, createdAt: serverTimestamp() });
+      setFamilyPassword('');
+      setCredentials({ name: '' });
       setFamilyAccessEndsAt(payload.expiresAt || Date.now() + 8 * 60 * 60 * 1000);
+      setFamilyAccess('name-required');
+    } catch (e) {
+      if (anonymousUser) await signOut(auth).catch(() => {});
+      setFamilyPassword('');
+      setFamilyAccess('locked');
+      if (e.code === 'auth/operation-not-allowed') setError('Ative “Anônimo” em Firebase Authentication → Provedores de acesso.');
+      else if (e.message?.includes('Failed to fetch') || e instanceof TypeError) setError(API_NOT_CONFIGURED);
+      else setError(e.message || 'Não foi possível liberar o acesso agora.');
+    } finally { setFamilyAccessBusy(false); }
+  }
+
+  async function saveFamilyName(event) {
+    event.preventDefault(); setError('');
+    const name = credentials.name.trim().replace(/\s+/g, ' ').slice(0, 80);
+    if (!user || !name || familyAccessBusy) return;
+    setFamilyAccessBusy(true);
+    try {
+      const idToken = await user.getIdToken();
+      const response = await fetch(backendUrl('/api/family/profile'), {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+        body: JSON.stringify({ displayName: name }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || 'Não foi possível salvar seu nome agora.');
+      await updateProfile(user, { displayName: name });
+      setFamilyName(name);
       setFamilyAccess('unlocked');
-    } catch (e) { setFamilyAccessError(e.message || 'Não foi possível verificar o acesso agora.'); }
+    } catch (e) { setError(e.message || 'Não foi possível salvar seu nome agora.'); }
     finally { setFamilyAccessBusy(false); }
   }
 
@@ -204,7 +225,7 @@ export default function App() {
     try {
       if (user) {
         const idToken = await user.getIdToken();
-        await fetch(`${import.meta.env.VITE_API_BASE_URL || ''}/api/family/session/end`, { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` }, body: '{}' });
+        await fetch(backendUrl('/api/family/session/end'), { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` }, body: '{}' });
       }
     } catch { /* A local sign-out still proceeds when the API is unreachable. */ }
     setFamilyAccess('locked');
@@ -216,7 +237,7 @@ export default function App() {
     if (!body || !user || sending) return;
     setSending(true); setError('');
     try {
-      await addDoc(collection(db, 'messages'), { groupId: active, text: body, senderId: user.uid, senderName: user.displayName || user.email.split('@')[0], createdAt: serverTimestamp() });
+      await addDoc(collection(db, 'messages'), { groupId: active, text: body, senderId: user.uid, senderName: familyName || user.displayName || 'Família', createdAt: serverTimestamp() });
       setText('');
     } catch (e) { setError(e?.code === 'permission-denied' ? firestoreMessage(e, 'enviar mensagens neste grupo') : e.message); }
     finally { setSending(false); }
@@ -225,7 +246,7 @@ export default function App() {
   async function forwardMessage(message) {
     if (!user || !message.text) return;
     try {
-      await addDoc(collection(db, 'messages'), { groupId: 'chateiros', text: message.text, senderId: user.uid, senderName: user.displayName || user.email.split('@')[0], createdAt: serverTimestamp(), forwarded: true, forwardedFrom: group.name });
+      await addDoc(collection(db, 'messages'), { groupId: 'chateiros', text: message.text, senderId: user.uid, senderName: familyName || user.displayName || 'Família', createdAt: serverTimestamp(), forwarded: true, forwardedFrom: group.name });
       setActive('chateiros');
       setError('Mensagem encaminhada para Chateiros.');
     } catch (e) { setError(e?.code === 'permission-denied' ? firestoreMessage(e, 'encaminhar mensagens') : e.message); }
@@ -240,7 +261,7 @@ export default function App() {
       watchRef.current = navigator.geolocation.watchPosition(async position => {
         const { latitude, longitude, accuracy, speed } = position.coords;
         try {
-          const location = { uid: user.uid, displayName: user.displayName || user.email.split('@')[0], latitude, longitude, accuracy, speed, ...(vehicleRole !== 'pessoa' ? { vehicle: vehicleRole } : {}), updatedAt: serverTimestamp(), online: true };
+          const location = { uid: user.uid, displayName: familyName || user.displayName || 'Família', latitude, longitude, accuracy, speed, ...(vehicleRole !== 'pessoa' ? { vehicle: vehicleRole } : {}), updatedAt: serverTimestamp(), online: true };
           await Promise.all(GROUPS.map(item => setDoc(doc(db, 'groups', item.id, 'locations', user.uid), location, { merge: true })));
         } catch (e) { setError(e?.code === 'permission-denied' ? firestoreMessage(e, 'compartilhar localização neste grupo') : e.message); navigator.geolocation.clearWatch(watchRef.current); setSharing(false); }
       }, e => { setError(e.code === 1 ? 'Permissão de localização negada. Ative-a nos ajustes do iPhone.' : 'Não foi possível obter a localização agora.'); setSharing(false); }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 });
@@ -254,7 +275,7 @@ export default function App() {
     setError(''); setCallState('connecting');
     try {
       const idToken = await user.getIdToken();
-      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL || ''}/api/livekit/token`, { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` }, body: JSON.stringify({ groupId: active, ...(recipientUid ? { recipientUid } : {}) }) });
+      const response = await fetch(backendUrl('/api/livekit/token'), { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` }, body: JSON.stringify({ groupId: active, ...(recipientUid ? { recipientUid } : {}) }) });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
         if (response.status === 503) throw new Error(`Configure no backend: ${(payload.missing || []).join(', ') || 'serviço indisponível'}.`);
@@ -288,9 +309,10 @@ export default function App() {
 
   if (!authReady) return <div className="loading-screen"><div className="brand-mark">L</div><span>Preparando sua viagem…</span></div>;
   if (!firebaseConfigured) return <SetupScreen />;
-  if (!user) return <AuthScreen mode={authMode} setMode={setAuthMode} credentials={credentials} setCredentials={setCredentials} submit={authenticate} error={error} />;
+  if (!user) return <AuthScreen password={familyPassword} setPassword={setFamilyPassword} passwordVisible={authPasswordVisible} setPasswordVisible={setAuthPasswordVisible} busy={familyAccessBusy} submit={authenticate} error={error} />;
   if (familyAccess === 'checking') return <FamilyAccessLoading />;
-  if (familyAccess !== 'unlocked') return <FamilyAccessScreen user={user} password={familyPassword} setPassword={setFamilyPassword} visible={showFamilyPassword} setVisible={setShowFamilyPassword} busy={familyAccessBusy} submit={enterFamilyAccess} error={familyAccessError} signOut={exitAccount} />;
+  if (familyAccess === 'name-required') return <FamilyNameScreen name={credentials.name} setName={name => setCredentials({ name })} busy={familyAccessBusy} submit={saveFamilyName} error={error} />;
+  if (familyAccess !== 'unlocked') return <FamilyAccessLoading />;
 
   const currentUserLocation = locations.find(item => item.uid === user.uid);
   const otherLocations = locations.filter(item => item.uid !== user.uid);
@@ -306,7 +328,7 @@ export default function App() {
       <button className="rail-icon" title="Privacidade" aria-label="Privacidade" onClick={() => setActivePanel('privacy')}><ShieldCheck size={18} /></button>
       <span className={`rail-icon wake-lock-indicator ${wakeLockStatus}`} role="status" aria-label={wakeLockStatus === 'active' ? 'Tela mantida ativa' : wakeLockStatus === 'unsupported' ? 'Este navegador não oferece bloqueio de tela' : wakeLockStatus === 'requesting' ? 'Solicitando tela ativa' : 'Bloqueio de tela indisponível'} title={wakeLockStatus === 'active' ? 'Tela mantida ativa enquanto o site estiver visível' : wakeLockStatus === 'unsupported' ? 'Bloqueio de tela não suportado neste navegador' : wakeLockStatus === 'requesting' ? 'Tentando manter a tela ativa' : 'O dispositivo liberou ou não permitiu o bloqueio de tela'}><Sun size={18} /></span>
       <button className="rail-icon" title="Sair" onClick={exitAccount} aria-label="Sair"><LogOut size={18} /></button>
-      <div className="rail-avatar">{(user.displayName || user.email)[0].toUpperCase()}<i /></div>
+      <div className="rail-avatar">{(familyName || user.displayName || 'F')[0].toUpperCase()}<i /></div>
     </nav>
 
     <button className={`sidebar-scrim ${menuOpen ? 'visible' : ''}`} aria-label="Fechar painel" onClick={() => setMenuOpen(false)} tabIndex={menuOpen ? 0 : -1} />
@@ -341,7 +363,7 @@ export default function App() {
     {callState !== 'idle' && <div className="call-dock" role="status"><span className={`call-wave ${callState}`}><Activity size={19}/></span><div className="call-info"><b>{callLabel}</b><span>{callTarget || group.name} · {speakers.length ? `${speakers.length} falando` : 'Conecte-se com a família'}</span></div><button className={`call-control ${muted ? 'is-muted' : ''}`} onClick={toggleMute} title={muted ? 'Ativar microfone' : 'Silenciar microfone'}>{muted ? <MicOff size={18}/> : <Mic size={18}/>}</button><button className="hangup" onClick={leaveCall} title="Sair da chamada"><Phone size={18}/></button></div>}
     <div className={`call-fab-wrap ${callState !== 'idle' ? 'in-call' : ''}`}>{callMenu && callState === 'idle' && <div className="call-menu"><b>Iniciar chamada de áudio</b><button onClick={() => { setCallTarget(null); startCall(); }}><Users size={15}/><span>Chamar grupo <small>{group.name}</small></span></button>{members.filter(member => member.id !== user.uid).map(member => <button key={member.id} onClick={() => { setCallTarget(member.displayName || 'Familiar'); startCall(member.id); }}><Phone size={14}/><span>{member.displayName || 'Familiar'} <small>Chamada individual</small></span></button>)}</div>}<span className="fab-hint">Ligue para o grupo</span><button className="call-fab" onClick={callState === 'idle' ? () => setCallMenu(!callMenu) : leaveCall} aria-label="Iniciar chamada de áudio"><Phone size={19} fill="currentColor"/></button></div>
     {activePanel && <div className="panel-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) setActivePanel(null); }}><section className="info-panel" role="dialog" aria-modal="true" aria-labelledby="info-panel-title"><button className="info-panel-close" onClick={() => setActivePanel(null)} aria-label="Fechar painel"><X size={18}/></button>
-      {activePanel === 'groups' && <><span className="eyebrow">ESPAÇO DA FAMÍLIA</span><h2 id="info-panel-title">Seus grupos</h2><p>Escolha uma conversa. Cada grupo tem mensagens e chamada próprias.</p><div className="panel-group-list">{GROUPS.map(item => <button key={item.id} onClick={() => { setActive(item.id); setActivePanel(null); }}><span className="group-icon" style={{ '--group-color': item.color }}><item.icon size={16}/></span><span><b>{item.name}</b><small>{item.text}</small></span><ArrowRight size={15}/></button>)}</div><div className="panel-note"><LockKeyhole size={15}/> A associação aos grupos é feita com segurança depois do login individual e da senha da família.</div></>}
+      {activePanel === 'groups' && <><span className="eyebrow">ESPAÇO DA FAMÍLIA</span><h2 id="info-panel-title">Seus grupos</h2><p>Escolha uma conversa. Cada grupo tem mensagens e chamada próprias.</p><div className="panel-group-list">{GROUPS.map(item => <button key={item.id} onClick={() => { setActive(item.id); setActivePanel(null); }}><span className="group-icon" style={{ '--group-color': item.color }}><item.icon size={16}/></span><span><b>{item.name}</b><small>{item.text}</small></span><ArrowRight size={15}/></button>)}</div><div className="panel-note"><LockKeyhole size={15}/> O servidor libera os grupos depois de validar a senha da família.</div></>}
       {activePanel === 'privacy' && <><span className="eyebrow">CONTROLES DA CONTA</span><h2 id="info-panel-title">Privacidade e localização</h2><p>Sua posição só é enviada enquanto você autoriza o compartilhamento. Você pode interromper quando quiser.</p><div className="panel-status"><span className={sharing ? 'status-dot on' : 'status-dot'}/><span>{sharing ? 'Compartilhamento ligado neste aparelho' : 'Sua posição não está sendo compartilhada por este aparelho'}</span></div><button className="panel-primary" onClick={() => { setActivePanel(null); toggleLocation(); }}>{sharing ? 'Parar de compartilhar' : 'Compartilhar minha posição'}</button><small className="panel-caption">A localização de outras pessoas só aparece com permissão e acesso ao grupo.</small></>}
       {activePanel === 'notifications' && <><span className="eyebrow">AVISOS</span><h2 id="info-panel-title">Notificações</h2><p>Notificações push ainda não foram configuradas neste projeto.</p><div className="panel-note"><Bell size={15}/> Para ativá-las é necessário configurar Firebase Cloud Messaging, a chave VAPID e o serviço de envio no backend.</div></>}
       {activePanel === 'help' && <><span className="eyebrow">GUIA RÁPIDO</span><h2 id="info-panel-title">Como usar</h2><ul className="panel-help-list"><li><b>Grupos:</b> escolha uma conversa no painel lateral.</li><li><b>Localização:</b> toque em “Compartilhar minha posição” para iniciar e novamente para parar.</li><li><b>Áudio:</b> use o botão de telefone e escolha chamada em grupo ou individual.</li><li><b>Mapa:</b> o botão de pin centraliza as posições reais disponíveis.</li></ul><div className="panel-note"><ShieldCheck size={15}/> Se aparecer falta de permissão, a conta precisa ser associada aos grupos no Firebase.</div></>}
@@ -358,17 +380,10 @@ function FamilyAccessLoading() {
   return <main className="family-access-loading"><div className="brand-mark">L</div><span>Verificando o acesso da família…</span></main>;
 }
 
-function FamilyAccessScreen({ user, password, setPassword, visible, setVisible, busy, submit, error, signOut: leave }) {
-  return <main className="family-access-screen">
-    <section className="family-access-art" aria-hidden="true">
-      <div className="access-topline"><div className="brand-mark">L</div><span>LONDON FAMILY TRACKER</span></div>
-      <div className="access-map-art"><span className="access-ring ring-a"/><span className="access-ring ring-b"/><span className="access-ring ring-c"/><svg className="access-route" viewBox="0 0 520 360" fill="none"><path d="M38 265 123 222l41 15 52-67 76 18 43-73 63 17 86-87" stroke="url(#routeGradient)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" strokeDasharray="7 9"/><defs><linearGradient id="routeGradient" x1="35" y1="265" x2="478" y2="44" gradientUnits="userSpaceOnUse"><stop stopColor="#65DCC0"/><stop offset="1" stopColor="#929CFF"/></linearGradient></defs></svg><span className="access-map-node node-a"><MapPin size={14}/></span><span className="access-map-node node-b"><CarFront size={14}/></span><span className="access-lock"><LockKeyhole size={27}/></span><span className="access-spark spark-a"/><span className="access-spark spark-b"/></div>
-      <div className="access-art-copy"><span className="eyebrow">UM ESPAÇO PRIVADO</span><h2>Perto, mesmo<br/>a muitos quilômetros.</h2><p>Seu mapa, suas mensagens e suas chamadas, só para quem faz parte da viagem.</p><div className="access-art-foot"><ShieldCheck size={14}/> Protegido pela família</div></div>
-    </section>
-    <section className="family-access-panel"><button className="access-logout" onClick={leave}><LogOut size={14}/> Trocar conta</button><div className="family-access-form-wrap"><span className="access-form-icon"><KeyRound size={19}/></span><div className="eyebrow">MAIS UM PASSO</div><h1>A senha da família.</h1><p>Olá, {user.displayName || user.email}. Entre com a senha compartilhada da família para abrir a viagem.</p><form className="family-access-form" onSubmit={submit}><label htmlFor="family-private-password">Senha privada</label><div className="private-input"><input id="family-private-password" name="family-access-key" type={visible ? 'text' : 'password'} autoComplete="off" autoFocus value={password} onChange={event => setPassword(event.target.value)} placeholder="Digite a senha da família" required/><button type="button" onClick={() => setVisible(!visible)} aria-label={visible ? 'Ocultar senha' : 'Mostrar senha'}>{visible ? <EyeOff size={17}/> : <Eye size={17}/>}</button></div>{error && <div className="family-access-error" role="alert">{error}</div>}<button className="family-access-submit" disabled={busy || !password}>{busy ? 'Verificando…' : 'Entrar'}{!busy && <ArrowRight size={17}/>}</button></form><div className="family-access-note"><LockKeyhole size={14}/><span>A senha é verificada com segurança e não fica salva neste aparelho.</span></div><div className="family-access-account"><span>Autenticado como <b>{user.email}</b></span><span className="individual-check"><Check size={12}/> Conta individual confirmada</span></div></div><div className="family-access-footer">LONDON FAMILY TRACKER <span>·</span> ESPAÇO PRIVADO DA FAMÍLIA</div></section>
-  </main>;
+function AuthScreen({ password, setPassword, passwordVisible, setPasswordVisible, busy, submit, error }) {
+  return <main className="auth-screen"><div className="auth-visual"><div className="auth-top"><div className="brand-mark">L</div><span>UMA VIAGEM. TODOS JUNTOS.</span></div><div className="auth-art"><span className="art-orbit one"/><span className="art-orbit two"/><span className="art-pin"><MapPin size={26}/></span><span className="art-point p1"/><span className="art-point p2"/><span className="art-point p3"/></div><div className="auth-caption"><span className="eyebrow">LONDON · FAMILY TRIP</span><h2>A cidade é grande.<br/><em>Vocês estão perto.</em></h2><p>Um lugar seguro para acompanhar, conversar e se encontrar.</p></div></div><section className="auth-panel"><div className="auth-form-wrap"><div className="eyebrow">LONDON FAMILY TRACKER</div><h1>Entre na viagem.</h1><p className="auth-lede">Digite a senha da família para continuar.</p><form onSubmit={submit} className="auth-form"><label>Senha da família<div className="private-input"><input required minLength={1} type={passwordVisible ? 'text' : 'password'} autoComplete="off" autoFocus value={password} onChange={e => setPassword(e.target.value)} placeholder="Senha compartilhada"/><button type="button" onClick={() => setPasswordVisible(!passwordVisible)} aria-label={passwordVisible ? 'Ocultar senha' : 'Mostrar senha'}>{passwordVisible ? <EyeOff size={16}/> : <Eye size={16}/>}</button></div></label>{error && <div className="auth-error" role="alert">{error}</div>}<button className="auth-submit" disabled={busy || !password}>{busy ? 'Verificando…' : 'Entrar na viagem'}{!busy && <LogIn size={17}/>}</button></form><div className="auth-private"><ShieldCheck size={15}/> A senha não fica salva neste aparelho.</div></div><div className="auth-footer">LONDON FAMILY TRACKER <span>·</span> ESPAÇO PRIVADO DA FAMÍLIA</div></section></main>;
 }
 
-function AuthScreen({ mode, setMode, credentials, setCredentials, submit, error }) {
-  return <main className="auth-screen"><div className="auth-visual"><div className="auth-top"><div className="brand-mark">L</div><span>UMA VIAGEM. TODOS JUNTOS.</span></div><div className="auth-art"><span className="art-orbit one"/><span className="art-orbit two"/><span className="art-pin"><MapPin size={26}/></span><span className="art-point p1"/><span className="art-point p2"/><span className="art-point p3"/></div><div className="auth-caption"><span className="eyebrow">LONDON · FAMILY TRIP</span><h2>A cidade é grande.<br/><em>Vocês estão perto.</em></h2><p>Um lugar seguro para acompanhar, conversar e se encontrar.</p></div></div><section className="auth-panel"><div className="auth-form-wrap"><div className="eyebrow">LONDON FAMILY TRACKER</div><h1>{mode === 'login' ? 'Bom ter você de volta.' : 'Entre para a família.'}</h1><p className="auth-lede">{mode === 'login' ? 'A viagem fica melhor quando estamos juntos.' : 'Crie sua conta para acompanhar a viagem.'}</p><form onSubmit={submit} className="auth-form">{mode === 'signup' && <label>Como podemos chamar você?<input required autoComplete="name" value={credentials.name} onChange={e => setCredentials({ ...credentials, name: e.target.value })} placeholder="Seu nome"/></label>}<label>Seu e-mail<input required type="email" autoComplete="email" value={credentials.email} onChange={e => setCredentials({ ...credentials, email: e.target.value })} placeholder="voce@email.com"/></label><label>Senha<input required minLength={6} type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} value={credentials.password} onChange={e => setCredentials({ ...credentials, password: e.target.value })} placeholder="Ao menos 6 caracteres"/></label>{error && <div className="auth-error">{error}</div>}<button className="auth-submit">{mode === 'login' ? 'Entrar na viagem' : 'Criar minha conta'}<LogIn size={17}/></button></form><div className="auth-switch">{mode === 'login' ? 'Ainda não tem uma conta?' : 'Já tem uma conta?'} <button onClick={() => setMode(mode === 'login' ? 'signup' : 'login')}>{mode === 'login' ? 'Criar conta' : 'Fazer login'}</button></div><div className="auth-private"><ShieldCheck size={15}/> Suas conversas e localização são protegidas.</div></div><div className="auth-footer">LONDON FAMILY TRACKER <span>·</span> OUTUBRO 2026</div></section></main>;
+function FamilyNameScreen({ name, setName, busy, submit, error }) {
+  return <main className="auth-screen"><div className="auth-visual"><div className="auth-top"><div className="brand-mark">L</div><span>UMA VIAGEM. TODOS JUNTOS.</span></div><div className="auth-art"><span className="art-orbit one"/><span className="art-orbit two"/><span className="art-pin"><Users size={25}/></span><span className="art-point p1"/><span className="art-point p2"/><span className="art-point p3"/></div><div className="auth-caption"><span className="eyebrow">LONDON · FAMILY TRIP</span><h2>Agora, como<br/><em>podemos chamar você?</em></h2><p>Seu nome aparece nas mensagens e no mapa quando você compartilhar sua posição.</p></div></div><section className="auth-panel"><div className="auth-form-wrap"><div className="eyebrow">ACESSO CONFIRMADO</div><h1>Qual é o seu nome?</h1><p className="auth-lede">Assim a família reconhece suas mensagens e sua posição compartilhada.</p><form onSubmit={submit} className="auth-form"><label>Seu nome<input required maxLength={80} autoComplete="name" autoFocus value={name} onChange={event => setName(event.target.value)} placeholder="Como podemos chamar você?"/></label>{error && <div className="auth-error" role="alert">{error}</div>}<button className="auth-submit" disabled={busy || !name.trim()}>{busy ? 'Salvando…' : 'Continuar'}{!busy && <ArrowRight size={17}/>}</button></form><div className="auth-private"><ShieldCheck size={15}/> O nome pode ser alterado na próxima entrada.</div></div><div className="auth-footer">LONDON FAMILY TRACKER <span>·</span> ESPAÇO PRIVADO DA FAMÍLIA</div></section></main>;
 }

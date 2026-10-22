@@ -254,14 +254,41 @@ app.post('/api/family/access', async (req, res) => {
     }
     const sessionId = randomBytes(32).toString('base64url');
     const expiresAt = Date.now() + SESSION_TTL_MS;
-    const displayName = String(user.name || user.email?.split('@')[0] || 'Membro').slice(0, 80);
-    await startFamilySessionAndJoinGroups(user.uid, displayName, sessionId, expiresAt);
+    await startFamilySessionAndJoinGroups(user.uid, 'Membro', sessionId, expiresAt);
     await clearRateAttempts(user.uid, req.ip);
     setFamilyCookie(res, makeFamilyCookie(user.uid, sessionId, expiresAt));
     res.set('Cache-Control', 'no-store');
     res.json({ active: true, expiresAt });
   } catch {
     res.status(503).json({ error: 'Family access could not be verified.' });
+  }
+});
+
+app.post('/api/family/profile', async (req, res) => {
+  if (!originAllowed(req)) return res.status(403).json({ error: 'Request origin is not allowed.' });
+  const user = await authenticatedUser(req);
+  if (!user) return res.status(401).json({ error: 'Authentication required.' });
+  if (!await sessionIsActive(req, user.uid)) return res.status(403).json({ error: 'Family access is required.' });
+  const displayName = typeof req.body?.displayName === 'string'
+    ? req.body.displayName.trim().replace(/\s+/g, ' ').slice(0, 80)
+    : '';
+  if (!displayName) return res.status(400).json({ error: 'Informe seu nome para continuar.' });
+  try {
+    const firestore = firebaseAdmin().firestore();
+    const batch = firestore.batch();
+    batch.set(firestore.doc(`users/${user.uid}`), {
+      displayName, createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    for (const [groupId] of FAMILY_GROUPS) {
+      batch.set(firestore.doc(`groups/${groupId}/members/${user.uid}`), {
+        uid: user.uid, displayName, role: 'member',
+      }, { merge: true });
+    }
+    await batch.commit();
+    res.set('Cache-Control', 'no-store');
+    res.json({ saved: true });
+  } catch {
+    res.status(503).json({ error: 'Não foi possível salvar seu nome agora.' });
   }
 });
 
