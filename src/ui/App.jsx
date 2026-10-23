@@ -293,14 +293,24 @@ export default function App() {
         throw new Error(payload.error || 'Não foi possível obter acesso à chamada.');
       }
       const { token, url } = payload;
-      const room = new Room({ adaptiveStream: true, dynacast: true, publishDefaults: { audioPreset: { maxBitrate: 32000 }, dtx: true, red: true } });
+      const room = new Room({
+        adaptiveStream: true,
+        dynacast: true,
+        // Give Opus enough headroom for natural full-band speech while keeping
+        // the stream modest for cellular data. RED/DTX stay enabled for mobile
+        // packet loss and silence efficiency.
+        publishDefaults: { audioPreset: { maxBitrate: 64000 }, dtx: true, red: true },
+        // Aggressive voice isolation can make some phone microphones sound
+        // metallic. Keep the browser's echo/noise controls and automatic gain.
+        audioCaptureDefaults: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, voiceIsolation: false },
+      });
       roomRef.current = room;
       room.on(RoomEvent.ConnectionStateChanged, state => setCallState(state === 'connected' ? 'active' : state === 'reconnecting' ? 'reconnecting' : state === 'disconnected' ? 'idle' : 'connecting'));
       room.on(RoomEvent.ActiveSpeakersChanged, activeSpeakers => setSpeakers(activeSpeakers.map(item => item.identity)));
       room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => { if (track.kind === Track.Kind.Audio) { const element = track.attach(); element.autoplay = true; element.setAttribute('playsinline', ''); document.body.appendChild(element); setRemoteAudio(items => [...items, element]); } });
       room.on(RoomEvent.Disconnected, () => { setCallState('idle'); roomRef.current = null; });
       await room.connect(url, token, { autoSubscribe: true });
-      await room.localParticipant.setMicrophoneEnabled(true, { echoCancellation: true, noiseSuppression: true, autoGainControl: true });
+      await room.localParticipant.setMicrophoneEnabled(true, { echoCancellation: true, noiseSuppression: true, autoGainControl: true, voiceIsolation: false });
       setMuted(false); setCallState('active'); setCallMenu(false);
     } catch (e) { setCallState('idle'); setError(e.name === 'NotAllowedError' ? 'Permita o acesso ao microfone para entrar na chamada.' : e.message); }
   }
