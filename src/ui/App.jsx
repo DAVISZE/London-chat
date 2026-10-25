@@ -52,6 +52,7 @@ export default function App() {
   const [error, setError] = useState('');
   const [sending, setSending] = useState(false);
   const [sharing, setSharing] = useState(false);
+  const [locationStatus, setLocationStatus] = useState('idle');
   const [callState, setCallState] = useState('idle');
   const [callMenu, setCallMenu] = useState(false);
   const [callTarget, setCallTarget] = useState(null);
@@ -146,7 +147,7 @@ export default function App() {
 
   useEffect(() => {
     if (familyAccess === 'unlocked') return;
-    if (watchRef.current !== null) { navigator.geolocation?.clearWatch(watchRef.current); watchRef.current = null; setSharing(false); }
+    if (watchRef.current !== null) { navigator.geolocation?.clearWatch(watchRef.current); watchRef.current = null; setSharing(false); setLocationStatus('idle'); }
     if (roomRef.current) { roomRef.current.disconnect(); roomRef.current = null; setCallState('idle'); }
   }, [familyAccess]);
 
@@ -264,19 +265,34 @@ export default function App() {
 
   async function toggleLocation() {
     if (!navigator.geolocation) { setError('Este dispositivo não oferece geolocalização.'); return; }
-    if (sharing) { navigator.geolocation.clearWatch(watchRef.current); watchRef.current = null; setSharing(false); return; }
+    if (sharing) { navigator.geolocation.clearWatch(watchRef.current); watchRef.current = null; setSharing(false); setLocationStatus('idle'); return; }
     if (!user) return;
     setError('');
+    if (!window.isSecureContext) { setError('A localização exige uma conexão segura (HTTPS). Abra o endereço publicado do site.'); return; }
     try {
+      setLocationStatus('locating');
       watchRef.current = navigator.geolocation.watchPosition(async position => {
         const { latitude, longitude, accuracy, speed } = position.coords;
         try {
           const location = { uid: user.uid, displayName: familyName || user.displayName || 'Família', latitude, longitude, accuracy, speed, ...(vehicleRole !== 'pessoa' ? { vehicle: vehicleRole } : {}), updatedAt: serverTimestamp(), online: true };
           await Promise.all(GROUPS.map(item => setDoc(doc(db, 'groups', item.id, 'locations', user.uid), location, { merge: true })));
-        } catch (e) { setError(e?.code === 'permission-denied' ? firestoreMessage(e, 'compartilhar localização neste grupo') : e.message); navigator.geolocation.clearWatch(watchRef.current); setSharing(false); }
-      }, e => { setError(e.code === 1 ? 'Permissão de localização negada. Ative-a nos ajustes do iPhone.' : 'Não foi possível obter a localização agora.'); setSharing(false); }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 });
+          setLocationStatus('sharing');
+        } catch (e) {
+          setError(e?.code === 'permission-denied' ? firestoreMessage(e, 'compartilhar localização neste grupo') : 'O GPS encontrou sua posição, mas não foi possível salvá-la. Verifique sua conexão e tente novamente.');
+          if (watchRef.current !== null) navigator.geolocation.clearWatch(watchRef.current);
+          watchRef.current = null; setSharing(false); setLocationStatus('idle');
+        }
+      }, e => {
+        if (watchRef.current !== null) navigator.geolocation.clearWatch(watchRef.current);
+        const message = e.code === 1
+          ? 'O iPhone bloqueou a localização. Em Ajustes, permita localização para Safari e para este site; depois tente novamente.'
+          : e.code === 2
+            ? 'O iPhone não conseguiu localizar o GPS. Ative Serviços de Localização, confira o sinal e tente perto de uma janela ou ao ar livre.'
+            : 'A busca do GPS demorou demais. Deixe o site aberto, confira o sinal e toque para tentar de novo.';
+        setError(message); setSharing(false); setLocationStatus('idle'); watchRef.current = null;
+      }, { enableHighAccuracy: true, maximumAge: 0, timeout: 45000 });
       setSharing(true);
-    } catch { setError('Não foi possível iniciar o compartilhamento.'); }
+    } catch { setLocationStatus('idle'); setError('Não foi possível iniciar o GPS. Confira a permissão de localização do navegador e tente novamente.'); }
   }
 
   async function startCall(recipientUid = null) {
@@ -342,7 +358,7 @@ export default function App() {
     <nav className="rail" aria-label="Navegação principal">
       <div className="rail-logo">L<span>F</span></div>
       <button className="rail-icon selected" title="Mapa" aria-label="Mapa" onClick={() => { setMenuOpen(false); window.dispatchEvent(new Event('map-recenter')); }}><MapPin size={19} /></button>
-      <button className="rail-icon" title="Grupos" onClick={() => setActivePanel('groups')} aria-label="Grupos"><Users size={18} /></button>
+      <button className="rail-icon" title="Grupos e controles" onClick={() => window.matchMedia('(max-width: 760px)').matches ? setMenuOpen(true) : setActivePanel('groups')} aria-label="Abrir grupos, conversas e localização"><Users size={18} /></button>
       <button className="rail-icon" title="Conversas" onClick={() => { setMenuOpen(true); window.setTimeout(() => document.querySelector('.chat-card')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 280); }} aria-label="Conversas"><MessageCircle size={18} /></button>
       <div className="rail-spacer" />
       <button className="rail-icon" title="Privacidade" aria-label="Privacidade" onClick={() => setActivePanel('privacy')}><ShieldCheck size={18} /></button>
@@ -362,8 +378,8 @@ export default function App() {
 
       <section className="vehicle-card"><div className="card-title"><span>NO MAPA</span><span className="live-label"><i/> AO VIVO</span></div>
         {[{ name: 'Carro 1', subtitle: 'Localização autorizada', color: '#64ddc0', car: locations.find(v => v.vehicle === 'carro-1') }, { name: 'Carro 2', subtitle: 'Localização autorizada', color: '#82a1ff', car: locations.find(v => v.vehicle === 'carro-2') }].map(vehicle => <div className="vehicle-row" key={vehicle.name}><span className="car-icon" style={{ color: vehicle.color }}><CarFront size={19}/></span><div className="vehicle-info"><b>{vehicle.name}</b><span>{vehicle.car ? `Atualizado ${timeLabel(vehicle.car.updatedAt)}` : vehicle.subtitle}</span></div><span className={`vehicle-status ${isFresh(vehicle.car?.updatedAt) ? 'online' : ''}`}>{isFresh(vehicle.car?.updatedAt) ? <><i/> Conectado</> : vehicle.car ? 'Último sinal' : 'Sem sinal'}</span></div>)}
-        <div className="location-consent"><MapPin size={13}/><span>{currentUserLocation ? `Sua posição atualizada às ${timeLabel(currentUserLocation.updatedAt)}` : 'Localização compartilhada só com sua autorização.'}</span></div>
-        <div className="location-options"><span>Compartilhar como</span><select value={vehicleRole} onChange={e => setVehicleRole(e.target.value)} aria-label="Tipo de localização"><option value="pessoa">Pessoa</option><option value="carro-1">Carro 1</option><option value="carro-2">Carro 2</option></select></div><button className={`location-button ${sharing ? 'sharing' : ''}`} onClick={toggleLocation}><Crosshair size={15}/>{sharing ? 'Parar de compartilhar' : 'Compartilhar minha posição'}</button>
+        <div className={`location-consent ${locationStatus}`}><MapPin size={13}/><span>{locationStatus === 'locating' ? 'Buscando sinal do GPS… mantenha o site aberto.' : currentUserLocation ? `Sua posição atualizada às ${timeLabel(currentUserLocation.updatedAt)}` : 'Localização compartilhada só com sua autorização.'}</span></div>
+        <div className="location-options"><span>Compartilhar como</span><select value={vehicleRole} onChange={e => setVehicleRole(e.target.value)} aria-label="Tipo de localização"><option value="pessoa">Pessoa</option><option value="carro-1">Carro 1</option><option value="carro-2">Carro 2</option></select></div><button className={`location-button ${sharing ? 'sharing' : ''}`} onClick={toggleLocation} aria-live="polite"><Crosshair size={15}/>{locationStatus === 'locating' ? 'Buscando localização… toque para parar' : sharing ? 'Parar de compartilhar' : 'Compartilhar minha posição'}</button>
       </section>
 
       <button type="button" className="journey-card" onClick={() => setActivePanel('trip')}><div className="section-heading"><span>ETAPA DA VIAGEM</span><span className="journey-badge"><Plane size={11}/> VOOS</span></div><div className="flight-route"><div className="airport"><span>ORIGEM</span><i>Detalhes a definir</i></div><div className="flight-line"><span>✈</span></div><div className="airport right"><span>LONDRES</span><i>Destino</i></div></div><div className="flight-foot"><span>Voo da família</span><span>Aguardando detalhes · ver</span></div></button>

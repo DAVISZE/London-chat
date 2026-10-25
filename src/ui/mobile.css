@@ -72,6 +72,9 @@
   .vehicle-card, .journey-card, .chat-card { padding: 12px; }
   .vehicle-row { height: 50px; }
   .location-button { height: 44px; font-size: 12px; }
+.location-consent.locating { color: #f1c77b; }
+.location-consent.locating svg { animation: location-search-pulse 1.2s ease-in-out infinite; }
+@keyframes location-search-pulse { 50% { opacity: .35; transform: scale(.88); } }
   .location-options select { min-height: 38px; font-size: 14px; }
   .sidebar .chat-card { min-height: 205px; flex: 1 0 205px; }
   .message-form { height: 48px; padding-left: 12px; gap: 7px; }
