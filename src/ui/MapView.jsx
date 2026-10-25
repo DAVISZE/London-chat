@@ -12,7 +12,7 @@ function escapeHtml(value = '') {
   return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 }
 
-export default function MapView({ locations, currentUid }) {
+export default function MapView({ locations, currentUid, focusedUid = '' }) {
   const nodeRef = useRef(null);
   const mapRef = useRef(null);
   const markersRef = useRef(new Map());
@@ -56,6 +56,20 @@ export default function MapView({ locations, currentUid }) {
       didFitRef.current = true;
     }
   }, [locations, currentUid]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    const marker = focusedUid ? markersRef.current.get(focusedUid) : null;
+    if (!map || !marker) return;
+    map.flyTo(marker.getLatLng(), Math.max(map.getZoom(), 15), { animate: true, duration: 0.65 });
+    marker.openPopup();
+  }, [focusedUid]);
+
+  useEffect(() => {
+    if (!focusedUid) return;
+    const marker = mapRef.current && markersRef.current.get(focusedUid);
+    if (marker) mapRef.current.panTo(marker.getLatLng(), { animate: true, duration: 0.4 });
+  }, [locations, focusedUid]);
 
   return <div className="map" ref={nodeRef} aria-label="Mapa de Londres e localizações autorizadas"/>;
 }

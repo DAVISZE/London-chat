@@ -57,6 +57,26 @@ function makeFamilyCookie(uid, sessionId, expiresAt) {
   return `${payload}.${signature}`;
 }
 
+function makeAccountCloseToken(uid, expiresAt = Date.now() + SESSION_TTL_MS) {
+  const payload = Buffer.from(JSON.stringify({ uid, exp: expiresAt })).toString('base64url');
+  const signature = createHmac('sha256', process.env.FAMILY_SESSION_SECRET).update(`close:${payload}`).digest('base64url');
+  return `${payload}.${signature}`;
+}
+
+function verifyAccountCloseToken(value) {
+  if (typeof value !== 'string') return null;
+  const [payload, signature, extra] = value.split('.');
+  if (!payload || !signature || extra) return null;
+  const expected = createHmac('sha256', process.env.FAMILY_SESSION_SECRET || '').update(`close:${payload}`).digest();
+  let provided;
+  try { provided = Buffer.from(signature, 'base64url'); } catch { return null; }
+  if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) return null;
+  try {
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    return data.uid && Number.isFinite(data.exp) && data.exp > Date.now() ? data : null;
+  } catch { return null; }
+}
+
 function productionCookieMode() {
   return process.env.NODE_ENV === 'production' || Boolean(process.env.K_SERVICE) || process.env.PUBLIC_HTTPS === 'true';
 }
@@ -139,6 +159,32 @@ async function clearRateAttempts(uid, ip) {
   ]);
 }
 
+async function deleteFamilyAccount(uid) {
+  const firestore = firebaseAdmin().firestore();
+  const messageCollection = firestore.collection('messages');
+  while (true) {
+    const authoredMessages = await messageCollection.where('senderId', '==', uid).limit(400).get();
+    if (authoredMessages.empty) break;
+    const batch = firestore.batch();
+    authoredMessages.docs.forEach(message => batch.delete(message.ref));
+    await batch.commit();
+  }
+
+  const privateRecords = [
+    firestore.doc(`users/${uid}`),
+    firestore.doc(`familyAccessSessions/${uid}`),
+    firestore.doc(`familyAccessAttempts/u_${rateKey(uid)}`),
+    ...FAMILY_GROUPS.flatMap(([groupId]) => [
+      firestore.doc(`groups/${groupId}/members/${uid}`),
+      firestore.doc(`groups/${groupId}/locations/${uid}`),
+    ]),
+  ];
+  await Promise.all(privateRecords.map(record => firestore.recursiveDelete(record)));
+
+  try { await firebaseAdmin().auth().deleteUser(uid); }
+  catch (error) { if (error?.code !== 'auth/user-not-found') throw error; }
+}
+
 async function startFamilySessionAndJoinGroups(uid, displayName, sessionId, expiresAt) {
   const firestore = firebaseAdmin().firestore();
   const batch = firestore.batch();
@@ -182,6 +228,7 @@ function passwordMatches(candidate) {
 
 app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.includes(origin)), credentials: true, methods: ['POST', 'GET'], allowedHeaders: ['Authorization', 'Content-Type'] }));
 app.use(express.json({ limit: '8kb' }));
+app.use(express.text({ type: 'text/plain', limit: '2kb' }));
 app.use((req, res, next) => { if (req.path.startsWith('/api/')) res.set('Cache-Control', 'no-store'); next(); });
 if (process.env.K_SERVICE) app.set('trust proxy', 1);
 
@@ -264,7 +311,7 @@ app.post('/api/family/access', async (req, res) => {
     await clearRateAttempts(user.uid, req.ip);
     setFamilyCookie(res, makeFamilyCookie(user.uid, sessionId, expiresAt));
     res.set('Cache-Control', 'no-store');
-    res.json({ active: true, expiresAt });
+    res.json({ active: true, expiresAt, closeToken: makeAccountCloseToken(user.uid, expiresAt) });
   } catch {
     res.status(503).json({ error: 'Family access could not be verified.' });
   }
@@ -292,7 +339,7 @@ app.post('/api/family/profile', async (req, res) => {
     }
     await batch.commit();
     res.set('Cache-Control', 'no-store');
-    res.json({ saved: true });
+    res.json({ saved: true, closeToken: makeAccountCloseToken(user.uid) });
   } catch {
     res.status(503).json({ error: 'Não foi possível salvar seu nome agora.' });
   }
@@ -303,14 +350,28 @@ app.post('/api/family/session/end', async (req, res) => {
   const user = await authenticatedUser(req);
   if (!user) return res.status(401).json({ error: 'Individual sign-in is required.' });
   try {
-    const cookie = familyCookie(req);
-    if (cookie?.uid === user.uid || await sessionIsActive(req, user.uid)) {
-      await firebaseAdmin().firestore().doc(`familyAccessSessions/${user.uid}`).set({ active: false, expiresAt: admin.firestore.Timestamp.fromMillis(Date.now()), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-    }
+    await deleteFamilyAccount(user.uid);
     clearFamilyCookie(res);
-    res.json({ active: false });
+    res.json({ active: false, deleted: true });
   } catch {
     res.status(503).json({ error: 'Family access could not be ended.' });
+  }
+});
+
+app.post('/api/family/session/close', async (req, res) => {
+  if (!originAllowed(req)) return res.status(403).end();
+  let body = req.body;
+  if (typeof body === 'string') {
+    try { body = JSON.parse(body); } catch { return res.status(400).end(); }
+  }
+  const closeSession = verifyAccountCloseToken(body?.token);
+  if (!closeSession) return res.status(401).end();
+  try {
+    await deleteFamilyAccount(closeSession.uid);
+    clearFamilyCookie(res);
+    return res.status(204).end();
+  } catch {
+    return res.status(503).end();
   }
 });
 

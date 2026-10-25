@@ -20,6 +20,16 @@ function backendUrl(path) {
   return `${API_BASE_URL}${path}`;
 }
 
+function queueAccountDeletion(closeToken) {
+  if (!closeToken) return;
+  try {
+    const url = backendUrl('/api/family/session/close');
+    const body = JSON.stringify({ token: closeToken });
+    if (navigator.sendBeacon?.(url, new Blob([body], { type: 'text/plain;charset=UTF-8' }))) return;
+    void fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body, keepalive: true }).catch(() => {});
+  } catch { /* The browser may be closing while the network is unavailable. */ }
+}
+
 function timeLabel(value) {
   if (!value) return 'agora';
   const date = value.toDate ? value.toDate() : new Date(value);
@@ -39,6 +49,26 @@ function firestoreMessage(error, feature) {
   return `Não foi possível carregar ${feature}. Tente novamente em instantes.`;
 }
 
+function MapFocusControl({ locations, currentUid, focusedUid, onFocus }) {
+  const [open, setOpen] = useState(false);
+  const candidates = locations.filter(location => Number.isFinite(location.latitude) && Number.isFinite(location.longitude));
+  const focused = candidates.find(location => location.uid === focusedUid);
+  const labelFor = location => location.uid === currentUid ? `Você · ${location.displayName || 'este aparelho'}` : location.displayName || (location.vehicle ? location.vehicle.replace('-', ' ') : 'Familiar');
+
+  return <div className="map-focus-control">
+    <button type="button" className="map-focus-button" onClick={() => setOpen(value => !value)} aria-expanded={open} aria-haspopup="listbox" disabled={!candidates.length}>
+      <Crosshair size={15}/><span>Focar em:</span><b>{focused ? labelFor(focused) : 'Escolher pessoa'}</b><ChevronDown size={13}/>
+    </button>
+    {open && <div className="map-focus-menu" role="listbox" aria-label="Pessoas com localização no mapa">
+      {candidates.length ? candidates.map(location => <button type="button" role="option" aria-selected={focusedUid === location.uid} key={location.uid} onClick={() => { onFocus(location.uid); setOpen(false); }}>
+        <span className={`focus-avatar ${location.vehicle || (location.uid === currentUid ? 'self' : '')}`}>{location.vehicle ? <CarFront size={14}/> : (location.displayName || '?').slice(0, 1).toUpperCase()}</span>
+        <span className="focus-person"><b>{labelFor(location)}</b><small>{location.vehicle ? 'Localização do carro' : 'Localização compartilhada'}</small></span>
+        {focusedUid === location.uid && <Check size={15}/>}
+      </button>) : <p>Ninguém está compartilhando localização agora.</p>}
+    </div>}
+  </div>;
+}
+
 export default function App() {
   const [user, setUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
@@ -47,6 +77,7 @@ export default function App() {
   const [familyPassword, setFamilyPassword] = useState('');
   const [familyAccessBusy, setFamilyAccessBusy] = useState(false);
   const [active, setActive] = useState('familia');
+  const [focusedUid, setFocusedUid] = useState('');
   const [messages, setMessages] = useState([]);
   const [members, setMembers] = useState([]);
   const [locations, setLocations] = useState([]);
@@ -74,8 +105,13 @@ export default function App() {
   const locationRequestRef = useRef(0);
   const locationWriteRef = useRef(false);
   const lastLocationWriteRef = useRef(0);
+  const closeTokenRef = useRef('');
   const messageEndRef = useRef(null);
   const group = useMemo(() => GROUPS.find(item => item.id === active) || GROUPS[0], [active]);
+
+  useEffect(() => {
+    if (focusedUid && !locations.some(location => location.uid === focusedUid)) setFocusedUid('');
+  }, [locations, focusedUid]);
 
   useEffect(() => {
     if (!firebaseConfigured) { setAuthReady(true); return; }
@@ -162,10 +198,10 @@ export default function App() {
   useEffect(() => {
     if (familyAccess !== 'unlocked' || !familyAccessEndsAt) return;
     const remaining = familyAccessEndsAt - Date.now();
-    if (remaining <= 0) { setFamilyAccess('locked'); signOut(auth); return; }
-    const timeout = window.setTimeout(() => { setFamilyAccess('locked'); signOut(auth); }, remaining);
+    if (remaining <= 0) { void exitAccount(); return; }
+    const timeout = window.setTimeout(() => { void exitAccount(); }, remaining);
     return () => window.clearTimeout(timeout);
-  }, [familyAccess, familyAccessEndsAt]);
+  }, [familyAccess, familyAccessEndsAt, user]);
 
   useEffect(() => {
     if (familyAccess === 'unlocked') return;
@@ -175,6 +211,25 @@ export default function App() {
     watchRef.current = null; setSharing(false); setLocationStatus('idle');
     if (roomRef.current) { roomRef.current.disconnect(); roomRef.current = null; setCallState('idle'); }
   }, [familyAccess]);
+
+  useEffect(() => {
+    if (!user || !['name-required', 'unlocked'].includes(familyAccess)) return;
+    let closedPageRestored = false;
+    const closeOnPageHide = () => {
+      closedPageRestored = true;
+      const token = closeTokenRef.current;
+      queueAccountDeletion(token);
+    };
+    const reopenFromBackForwardCache = event => {
+      if (event.persisted && closedPageRestored) window.location.reload();
+    };
+    window.addEventListener('pagehide', closeOnPageHide);
+    window.addEventListener('pageshow', reopenFromBackForwardCache);
+    return () => {
+      window.removeEventListener('pagehide', closeOnPageHide);
+      window.removeEventListener('pageshow', reopenFromBackForwardCache);
+    };
+  }, [user, familyAccess]);
 
   useEffect(() => {
     if (!user || !db || familyAccess !== 'unlocked') return;
@@ -222,6 +277,7 @@ export default function App() {
         if (response.status === 503) throw new Error(`O servidor precisa de configuração: ${(payload.missing || []).join(', ')}.`);
         throw new Error(payload.error || 'Não foi possível liberar o acesso agora.');
       }
+      closeTokenRef.current = payload.closeToken || '';
       setFamilyPassword('');
       setCredentials({ name: '' });
       setFamilyAccessEndsAt(payload.expiresAt || Date.now() + 8 * 60 * 60 * 1000);
@@ -250,6 +306,7 @@ export default function App() {
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error || 'Não foi possível salvar seu nome agora.');
+      closeTokenRef.current = payload.closeToken || '';
       await updateProfile(user, { displayName: name });
       setFamilyName(name);
       setFamilyAccess('unlocked');
@@ -258,12 +315,16 @@ export default function App() {
   }
 
   async function exitAccount() {
+    let deleted = false;
     try {
       if (user) {
         const idToken = await user.getIdToken();
-        await fetch(backendUrl('/api/family/session/end'), { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` }, body: '{}' });
+        const response = await fetch(backendUrl('/api/family/session/end'), { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` }, body: '{}' });
+        deleted = response.ok;
       }
     } catch { /* A local sign-out still proceeds when the API is unreachable. */ }
+    if (!deleted) queueAccountDeletion(closeTokenRef.current);
+    closeTokenRef.current = '';
     setFamilyAccess('locked');
     await signOut(auth);
   }
@@ -452,7 +513,7 @@ export default function App() {
     </aside>
 
       <section className="map-area"><div className="map-topbar"><div className="map-title"><span className="map-live"><i/></span><div><b>O mapa da nossa viagem</b><span>{locations.length} {locations.length === 1 ? 'pessoa compartilhando localização' : 'localizações compartilhadas'}</span></div></div><div className="map-top-actions"><div className="member-stack">{members.slice(0, 4).map((member, i) => <span key={member.id} title={member.displayName || 'Membro'} style={{ '--avatar-color': ['#eeb39c', '#b8a5ed', '#83cdb7', '#f0cb85'][i % 4] }}>{(member.displayName || '?')[0].toUpperCase()}</span>)}{members.length === 0 && <span className="stack-empty"><Users size={14}/></span>}</div><button className="map-action" aria-label="Notificações" onClick={() => setActivePanel('notifications')}><Bell size={17}/><i/></button><button className="map-action" aria-label="Ajuda" onClick={() => setActivePanel('help')}><CircleHelp size={17}/></button></div></div>
-      <div className="map-wrap"><MapView locations={locations} currentUid={user.uid}/><div className="map-label"><span className="map-label-pin"><Compass size={16}/></span><div><b>Área de viagem</b><span>Londres e arredores</span></div><span className="label-chevron">⌄</span></div><div className="map-legend"><span><i className="legend-dot me"/> Você</span><span><i className="legend-dot car1"/> Carro 1</span><span><i className="legend-dot car2"/> Carro 2</span></div><div className="map-attribution">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a></div><button className="recenter" onClick={() => window.dispatchEvent(new Event('map-recenter'))} title="Centralizar localizações" aria-label="Centralizar mapa"><Navigation size={18}/></button></div>
+      <div className="map-wrap"><MapView locations={locations} currentUid={user.uid} focusedUid={focusedUid}/><MapFocusControl locations={locations} currentUid={user.uid} focusedUid={focusedUid} onFocus={setFocusedUid}/><div className="map-label"><span className="map-label-pin"><Compass size={16}/></span><div><b>Área de viagem</b><span>Londres e arredores</span></div><span className="label-chevron">⌄</span></div><div className="map-legend"><span><i className="legend-dot me"/> Você</span><span><i className="legend-dot car1"/> Carro 1</span><span><i className="legend-dot car2"/> Carro 2</span></div><div className="map-attribution">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a></div><button className="recenter" onClick={() => window.dispatchEvent(new Event('map-recenter'))} title="Centralizar localizações" aria-label="Centralizar mapa"><Navigation size={18}/></button></div>
       <div className="map-bottom"><span className="secure-note"><ShieldCheck size={15}/> Localização apenas com consentimento</span><span className="map-signal"><SignalHigh size={15}/> Atualização ao vivo</span></div></section>
 
     {error && <div className="toast" role="alert"><span>{error}</span><button onClick={() => setError('')} aria-label="Fechar"><X size={16}/></button></div>}
@@ -460,7 +521,7 @@ export default function App() {
     <div className={`call-fab-wrap ${callState !== 'idle' ? 'in-call' : ''}`}>{callMenu && callState === 'idle' && <div className="call-menu"><b>Iniciar chamada de áudio</b><button onClick={() => { setCallTarget(null); startCall(); }}><Users size={15}/><span>Chamar grupo <small>{group.name}</small></span></button>{members.filter(member => member.id !== user.uid).map(member => <button key={member.id} onClick={() => { setCallTarget(member.displayName || 'Familiar'); startCall(member.id); }}><Phone size={14}/><span>{member.displayName || 'Familiar'} <small>Chamada individual</small></span></button>)}</div>}<span className="fab-hint">Ligue para o grupo</span><button className="call-fab" onClick={callState === 'idle' ? () => setCallMenu(!callMenu) : leaveCall} aria-label="Iniciar chamada de áudio"><Phone size={19} fill="currentColor"/></button></div>
     {activePanel && <div className="panel-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) setActivePanel(null); }}><section className="info-panel" role="dialog" aria-modal="true" aria-labelledby="info-panel-title"><button className="info-panel-close" onClick={() => setActivePanel(null)} aria-label="Fechar painel"><X size={18}/></button>
       {activePanel === 'groups' && <><span className="eyebrow">ESPAÇO DA FAMÍLIA</span><h2 id="info-panel-title">Seus grupos</h2><p>Escolha uma conversa. Cada grupo tem mensagens e chamada próprias.</p><div className="panel-group-list">{GROUPS.map(item => <button key={item.id} onClick={() => { setActive(item.id); setActivePanel(null); }}><span className="group-icon" style={{ '--group-color': item.color }}><item.icon size={16}/></span><span><b>{item.name}</b><small>{item.text}</small></span><ArrowRight size={15}/></button>)}</div><div className="panel-note"><LockKeyhole size={15}/> O servidor libera os grupos depois de validar a senha da família.</div></>}
-      {activePanel === 'privacy' && <><span className="eyebrow">CONTROLES DA CONTA</span><h2 id="info-panel-title">Privacidade e localização</h2><p>Sua posição só é enviada enquanto você autoriza o compartilhamento. Você pode interromper quando quiser.</p><div className="panel-status"><span className={sharing ? 'status-dot on' : 'status-dot'}/><span>{sharing ? 'Compartilhamento ligado neste aparelho' : locationPermission === 'denied' ? 'Permissão do Safari bloqueada' : 'Sua posição não está sendo compartilhada por este aparelho'}</span></div><button className="panel-primary" onClick={() => { setActivePanel(null); toggleLocation(); }}>{sharing ? 'Parar de compartilhar' : 'Tentar compartilhar localização'}</button><div className="panel-note location-help"><MapPin size={15}/><span>No iPhone: Ajustes → Apps → Safari → Localização. Para este site, abra-o no Safari, toque em <b>aA → Ajustes do Site → Localização → Permitir</b>. Depois tente novamente. <a href="https://support.apple.com/en-euro/guide/iphone/iphb01fc3c85/27/ios/27" target="_blank" rel="noreferrer">Guia da Apple</a>.</span></div><small className="panel-caption">A posição só aparece aos membros da família com acesso válido.</small></>}
+      {activePanel === 'privacy' && <><span className="eyebrow">CONTROLES DA CONTA</span><h2 id="info-panel-title">Privacidade e localização</h2><p>Sua posição só é enviada enquanto você autoriza o compartilhamento. Você pode interromper quando quiser.</p><div className="panel-status"><span className={sharing ? 'status-dot on' : 'status-dot'}/><span>{sharing ? 'Compartilhamento ligado neste aparelho' : locationPermission === 'denied' ? 'Permissão do Safari bloqueada' : 'Sua posição não está sendo compartilhada por este aparelho'}</span></div><button className="panel-primary" onClick={() => { setActivePanel(null); toggleLocation(); }}>{sharing ? 'Parar de compartilhar' : 'Tentar compartilhar localização'}</button><div className="panel-note location-help"><MapPin size={15}/><span>No iPhone: Ajustes → Apps → Safari → Localização. Para este site, abra-o no Safari, toque em <b>aA → Ajustes do Site → Localização → Permitir</b>. Depois tente novamente. <a href="https://support.apple.com/en-euro/guide/iphone/iphb01fc3c85/27/ios/27" target="_blank" rel="noreferrer">Guia da Apple</a>.</span></div><div className="panel-note"><LockKeyhole size={15}/><span>Ao tocar em Sair ou fechar a página com conexão, o app pede ao servidor para apagar esta conta temporária, as mensagens dela e suas posições.</span></div><small className="panel-caption">A posição só aparece aos membros da família com acesso válido.</small></>}
       {activePanel === 'notifications' && <><span className="eyebrow">AVISOS</span><h2 id="info-panel-title">Notificações</h2><p>Notificações push ainda não foram configuradas neste projeto.</p><div className="panel-note"><Bell size={15}/> Para ativá-las é necessário configurar Firebase Cloud Messaging, a chave VAPID e o serviço de envio no backend.</div></>}
       {activePanel === 'help' && <><span className="eyebrow">GUIA RÁPIDO</span><h2 id="info-panel-title">Como usar</h2><ul className="panel-help-list"><li><b>Grupos:</b> escolha uma conversa no painel lateral.</li><li><b>Localização:</b> toque em “Compartilhar minha posição” para iniciar e novamente para parar.</li><li><b>Áudio:</b> use o botão de telefone e escolha chamada em grupo ou individual.</li><li><b>Mapa:</b> o botão de pin centraliza as posições reais disponíveis.</li></ul><div className="panel-note"><ShieldCheck size={15}/> Se aparecer falta de permissão, a conta precisa ser associada aos grupos no Firebase.</div></>}
       {activePanel === 'trip' && <><span className="eyebrow">PLANEJAMENTO</span><h2 id="info-panel-title">Etapa do voo</h2><p>Os dados do voo ainda não foram cadastrados. Nenhum horário ou número foi inventado.</p><div className="panel-note"><Plane size={15}/> Quando os detalhes forem definidos, o administrador poderá adicioná-los à viagem.</div></>}
