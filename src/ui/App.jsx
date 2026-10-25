@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { inMemoryPersistence, onAuthStateChanged, setPersistence, signInAnonymously, signOut, updateProfile } from 'firebase/auth';
 import { addDoc, collection, doc, limit, onSnapshot, query, serverTimestamp, where, writeBatch } from 'firebase/firestore';
-import { Room, RoomEvent, Track } from 'livekit-client';
-import { Activity, ArrowRight, Bell, CarFront, Check, ChevronDown, CircleHelp, Compass, Crosshair, Eye, EyeOff, Forward, LogIn, LogOut, LockKeyhole, MapPin, Menu, MessageCircle, Mic, MicOff, Navigation, Phone, Plane, Send, ShieldCheck, SignalHigh, Sun, Users, X } from 'lucide-react';
+import { AudioPresets, ConnectionQuality, LocalAudioTrack, Room, RoomEvent, Track } from 'livekit-client';
+import { Activity, ArrowRight, Bell, CarFront, Check, ChevronDown, CircleHelp, Compass, Crosshair, Eye, EyeOff, Forward, LogIn, LogOut, LockKeyhole, MapPin, Menu, MessageCircle, Mic, MicOff, Music2, Navigation, Pause, Phone, PhoneOff, Plane, Play, Send, ShieldCheck, SignalHigh, Sun, Trash2, Users, Volume2, X } from 'lucide-react';
 import { auth, db, firebaseConfigured } from '../firebase.js';
 import MapView from './MapView.jsx';
 
@@ -96,16 +96,29 @@ export default function App() {
   const [callMenu, setCallMenu] = useState(false);
   const [callTarget, setCallTarget] = useState(null);
   const [muted, setMuted] = useState(false);
+  const [callQuality, setCallQuality] = useState(ConnectionQuality.Unknown);
+  const [callParticipants, setCallParticipants] = useState(1);
+  const [audioPlaybackBlocked, setAudioPlaybackBlocked] = useState(false);
+  const [sharedMusic, setSharedMusic] = useState(null);
+  const [musicVolume, setMusicVolume] = useState(0.72);
   const [vehicleRole, setVehicleRole] = useState('pessoa');
   const [speakers, setSpeakers] = useState([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const [credentials, setCredentials] = useState({ name: '' });
   const [authPasswordVisible, setAuthPasswordVisible] = useState(false);
   const [familyName, setFamilyName] = useState('');
-  const [remoteAudio, setRemoteAudio] = useState([]);
   const [wakeLockStatus, setWakeLockStatus] = useState('requesting');
   const [activePanel, setActivePanel] = useState(null);
   const roomRef = useRef(null);
+  const musicFileInputRef = useRef(null);
+  const remoteAudioElementsRef = useRef(new Map());
+  const sharedMusicRef = useRef(null);
+  const musicElementRef = useRef(null);
+  const musicContextRef = useRef(null);
+  const musicGainRef = useRef(null);
+  const musicTrackRef = useRef(null);
+  const musicUrlRef = useRef('');
+  const musicVolumeTimerRef = useRef(null);
   const watchRef = useRef(null);
   const locationRequestRef = useRef(0);
   const locationWriteRef = useRef(false);
@@ -113,6 +126,204 @@ export default function App() {
   const closeTokenRef = useRef('');
   const messageEndRef = useRef(null);
   const group = useMemo(() => GROUPS.find(item => item.id === active) || GROUPS[0], [active]);
+
+  function setMusicState(value) {
+    sharedMusicRef.current = value;
+    setSharedMusic(value);
+    if (Number.isFinite(value?.volume)) setMusicVolume(value.volume);
+  }
+
+  async function publishMusicPacket(packet) {
+    const room = roomRef.current;
+    if (!room || room.state !== 'connected') throw new Error('Entre numa chamada para compartilhar música com a família.');
+    await room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(packet)), { reliable: true, topic: 'lft-family-music' });
+  }
+
+  async function broadcastMusicState(value = sharedMusicRef.current) {
+    if (!value) return;
+    await publishMusicPacket({ type: 'state', ...value });
+  }
+
+  function disposeLocalMusic() {
+    if (musicVolumeTimerRef.current) window.clearTimeout(musicVolumeTimerRef.current);
+    musicVolumeTimerRef.current = null;
+    musicElementRef.current?.pause();
+    if (musicElementRef.current) {
+      musicElementRef.current.removeAttribute('src');
+      musicElementRef.current.load();
+    }
+    musicElementRef.current = null;
+    musicGainRef.current = null;
+    musicTrackRef.current?.stop();
+    musicTrackRef.current = null;
+    const context = musicContextRef.current;
+    musicContextRef.current = null;
+    if (context && context.state !== 'closed') void context.close().catch(() => {});
+    if (musicUrlRef.current) URL.revokeObjectURL(musicUrlRef.current);
+    musicUrlRef.current = '';
+  }
+
+  async function stopSharedMusic(broadcast = true) {
+    const current = sharedMusicRef.current;
+    const room = roomRef.current;
+    if (broadcast && current && room?.state === 'connected') {
+      await publishMusicPacket({ type: 'state', action: 'ended', ownerUid: current.ownerUid, title: current.title }).catch(() => {});
+    }
+    const track = musicTrackRef.current;
+    if (track && room?.state === 'connected') await room.localParticipant.unpublishTrack(track).catch(() => {});
+    disposeLocalMusic();
+    setMusicState(null);
+  }
+
+  async function applyMusicControl(action, value) {
+    const audio = musicElementRef.current;
+    const current = sharedMusicRef.current;
+    if (!audio || !current || current.ownerUid !== user?.uid) return;
+    try {
+      if (action === 'play') {
+        await musicContextRef.current?.resume();
+        await audio.play();
+      } else if (action === 'pause') audio.pause();
+      else if (action === 'volume') {
+        const nextVolume = Math.max(0, Math.min(1, Number(value)));
+        if (!Number.isFinite(nextVolume)) return;
+        if (musicGainRef.current && musicContextRef.current) musicGainRef.current.gain.setTargetAtTime(nextVolume, musicContextRef.current.currentTime, 0.025);
+      } else if (action === 'stop') {
+        await stopSharedMusic(true);
+        return;
+      } else return;
+
+      const next = { ...current, playing: !audio.paused, volume: musicGainRef.current?.gain.value ?? current.volume };
+      setMusicState(next);
+      await broadcastMusicState(next);
+    } catch {
+      setError('Não foi possível controlar a música agora. Confira a chamada e tente novamente.');
+    }
+  }
+
+  function requestMusicControl(action, value) {
+    const current = sharedMusicRef.current;
+    if (!current) return;
+    if (current.ownerUid === user?.uid) {
+      if (action === 'volume') {
+        setMusicVolume(value);
+        if (musicVolumeTimerRef.current) window.clearTimeout(musicVolumeTimerRef.current);
+        musicVolumeTimerRef.current = window.setTimeout(() => void applyMusicControl('volume', value), 120);
+      } else void applyMusicControl(action, value);
+      return;
+    }
+    if (action === 'volume') setMusicVolume(value);
+    void publishMusicPacket({ type: 'control', action, value }).catch(() => setError('A chamada perdeu a conexão. Tente controlar a música de novo.'));
+  }
+
+  async function startSharedMusic(file) {
+    const room = roomRef.current;
+    if (!file || !room || callState !== 'active') {
+      setError('Entre numa chamada ativa em grupo antes de compartilhar um MP3.');
+      return;
+    }
+    if (!/\.mp3$/i.test(file.name) && file.type !== 'audio/mpeg') {
+      setError('Escolha um arquivo MP3.');
+      return;
+    }
+    if (sharedMusicRef.current) {
+      setError('Já tem uma música compartilhada. Toque em encerrar antes de escolher outra.');
+      return;
+    }
+    if (!window.AudioContext && !window.webkitAudioContext) {
+      setError('Este navegador não permite transmitir um MP3 pela chamada. Tente a versão mais recente do Safari ou Chrome.');
+      return;
+    }
+
+    let context;
+    let audio;
+    let track;
+    try {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      context = new AudioContextClass({ latencyHint: 'interactive' });
+      audio = new Audio();
+      const objectUrl = URL.createObjectURL(file);
+      audio.src = objectUrl;
+      audio.preload = 'auto';
+      audio.loop = false;
+      const source = context.createMediaElementSource(audio);
+      const gain = context.createGain();
+      const destination = context.createMediaStreamDestination();
+      gain.gain.value = musicVolume;
+      source.connect(gain);
+      gain.connect(destination);
+      // Let the person sharing the file hear it too; WebRTC echo cancellation
+      // remains enabled on the separate microphone track.
+      gain.connect(context.destination);
+      musicUrlRef.current = objectUrl;
+      musicElementRef.current = audio;
+      musicContextRef.current = context;
+      musicGainRef.current = gain;
+
+      const resumePromise = context.resume();
+      const playPromise = audio.play();
+      await Promise.all([resumePromise, playPromise]);
+      if (roomRef.current !== room || room.state !== 'connected') throw new Error('A chamada se desconectou.');
+
+      track = new LocalAudioTrack(destination.stream.getAudioTracks()[0], {}, true);
+      track.source = Track.Source.Microphone;
+      musicTrackRef.current = track;
+      await room.localParticipant.publishTrack(track, {
+        source: Track.Source.Microphone,
+        name: 'family-shared-music',
+        audioPreset: AudioPresets.music,
+        dtx: false,
+        red: true,
+        forceStereo: true,
+      });
+      if (roomRef.current !== room) throw new Error('A chamada se desconectou.');
+
+      const state = { title: file.name.replace(/\.mp3$/i, '').slice(0, 100) || 'Música da família', ownerUid: user.uid, ownerName: familyName || user.displayName || 'Família', playing: true, volume: musicVolume };
+      setMusicState(state);
+      await broadcastMusicState(state);
+      audio.addEventListener('ended', () => { if (musicTrackRef.current === track) void stopSharedMusic(true); }, { once: true });
+    } catch (e) {
+      if (track && roomRef.current === room && room.state === 'connected') await room.localParticipant.unpublishTrack(track).catch(() => {});
+      disposeLocalMusic();
+      setMusicState(null);
+      setError(e.name === 'NotAllowedError' ? 'O navegador bloqueou o áudio. Toque no botão de música e permita a reprodução.' : e.message || 'Não foi possível compartilhar esse MP3. Confira a chamada e tente de novo.');
+    }
+  }
+
+  function detachRemoteAudio(track) {
+    const element = remoteAudioElementsRef.current.get(track);
+    if (!element) return;
+    track.detach(element);
+    element.pause();
+    element.srcObject = null;
+    element.remove();
+    remoteAudioElementsRef.current.delete(track);
+  }
+
+  function clearRemoteAudio(updateUi = true) {
+    remoteAudioElementsRef.current.forEach((element, track) => {
+      track.detach(element);
+      element.pause();
+      element.srcObject = null;
+      element.remove();
+    });
+    remoteAudioElementsRef.current.clear();
+    if (updateUi) setAudioPlaybackBlocked(false);
+  }
+
+  async function unlockCallAudio() {
+    const room = roomRef.current;
+    if (!room) return;
+    try {
+      await room.startAudio();
+      const elements = [...remoteAudioElementsRef.current.values()];
+      await Promise.all(elements.map(element => element.play()));
+      setAudioPlaybackBlocked(false);
+    } catch {
+      setAudioPlaybackBlocked(true);
+      setError('Toque em “Ativar áudio” novamente ou confira o modo silencioso e a saída de som do iPhone.');
+    }
+  }
 
   useEffect(() => {
     if (focusedUid && !locations.some(location => location.uid === focusedUid)) setFocusedUid('');
@@ -214,7 +425,7 @@ export default function App() {
     locationRequestRef.current += 1;
     if (watchRef.current !== null) navigator.geolocation?.clearWatch(watchRef.current);
     watchRef.current = null; setSharing(false); setLocationStatus('idle');
-    if (roomRef.current) { roomRef.current.disconnect(); roomRef.current = null; setCallState('idle'); }
+    if (roomRef.current) { const room = roomRef.current; roomRef.current = null; room.disconnect(); clearRemoteAudio(); disposeLocalMusic(); setMusicState(null); setCallState('idle'); setSpeakers([]); setCallParticipants(0); }
   }, [familyAccess]);
 
   useEffect(() => {
@@ -258,7 +469,14 @@ export default function App() {
   }, [activePanel]);
 
   useEffect(() => { messageEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, [messages]);
-  useEffect(() => () => { locationRequestRef.current += 1; if (watchRef.current !== null) navigator.geolocation?.clearWatch(watchRef.current); roomRef.current?.disconnect(); }, []);
+  useEffect(() => () => {
+    locationRequestRef.current += 1;
+    if (watchRef.current !== null) navigator.geolocation?.clearWatch(watchRef.current);
+    roomRef.current?.disconnect();
+    roomRef.current = null;
+    clearRemoteAudio(false);
+    disposeLocalMusic();
+  }, []);
 
   async function authenticate(event) {
     event.preventDefault(); setError('');
@@ -424,7 +642,86 @@ export default function App() {
     if (callState !== 'idle' || !user) return;
     setCallTarget(recipientUid ? members.find(member => member.id === recipientUid)?.displayName || 'Familiar' : null);
     setError(''); setCallState('connecting');
+    let room = null;
     try {
+      const audioCaptureDefaults = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, voiceIsolation: false };
+      room = new Room({
+        publishDefaults: { audioPreset: { maxBitrate: 64000 }, dtx: true, red: true },
+        audioCaptureDefaults,
+      });
+      roomRef.current = room;
+      setAudioPlaybackBlocked(false); setCallQuality(ConnectionQuality.Unknown); setCallParticipants(1);
+
+      // Unlock mobile-browser audio during the original tap, before network awaits.
+      void room.startAudio().then(() => {
+        if (roomRef.current === room) setAudioPlaybackBlocked(!room.canPlaybackAudio);
+      }).catch(() => { if (roomRef.current === room) setAudioPlaybackBlocked(true); });
+
+      room.on(RoomEvent.ConnectionStateChanged, state => {
+        if (roomRef.current !== room) return;
+        setCallState(state === 'connected' ? 'active' : state === 'reconnecting' ? 'reconnecting' : state === 'disconnected' ? 'idle' : 'connecting');
+      });
+      room.on(RoomEvent.Reconnecting, () => { if (roomRef.current === room) setCallState('reconnecting'); });
+      room.on(RoomEvent.Reconnected, () => {
+        if (roomRef.current !== room) return;
+        setCallState('active'); setCallParticipants(room.remoteParticipants.size + 1); setMuted(!room.localParticipant.isMicrophoneEnabled);
+        setAudioPlaybackBlocked(!room.canPlaybackAudio);
+      });
+      room.on(RoomEvent.ActiveSpeakersChanged, activeSpeakers => setSpeakers(activeSpeakers.map(item => item.identity)));
+      room.on(RoomEvent.ConnectionQualityChanged, (quality, participant) => {
+        const qualities = [quality, room.localParticipant.connectionQuality, ...Array.from(room.remoteParticipants.values()).map(item => item.connectionQuality)]
+          .filter(item => item && item !== ConnectionQuality.Unknown);
+        const priority = { [ConnectionQuality.Excellent]: 0, [ConnectionQuality.Good]: 1, [ConnectionQuality.Poor]: 2, [ConnectionQuality.Lost]: 3 };
+        const overall = qualities.reduce((worst, item) => (priority[item] ?? 0) > (priority[worst] ?? 0) ? item : worst, ConnectionQuality.Excellent);
+        setCallQuality(qualities.length ? overall : participant.connectionQuality || ConnectionQuality.Unknown);
+      });
+      room.on(RoomEvent.ParticipantConnected, () => {
+        setCallParticipants(room.remoteParticipants.size + 1);
+        if (sharedMusicRef.current?.ownerUid === user.uid) void broadcastMusicState().catch(() => {});
+      });
+      room.on(RoomEvent.ParticipantDisconnected, participant => {
+        setCallParticipants(Math.max(1, room.remoteParticipants.size + 1));
+        if (participant.identity === sharedMusicRef.current?.ownerUid && participant.identity !== user.uid) setMusicState(null);
+      });
+      room.on(RoomEvent.DataReceived, (payload, participant, _kind, topic) => {
+        if (topic !== 'lft-family-music' || !participant) return;
+        try {
+          const packet = JSON.parse(new TextDecoder().decode(payload));
+          if (packet.type === 'state' && participant.identity === packet.ownerUid) {
+            if (packet.action === 'ended') setMusicState(null);
+            else setMusicState({ title: String(packet.title || 'Música compartilhada').slice(0, 100), ownerUid: packet.ownerUid, ownerName: String(packet.ownerName || participant.name || 'Família').slice(0, 80), playing: packet.playing === true, volume: Math.max(0, Math.min(1, Number(packet.volume) || 0)) });
+          } else if (packet.type === 'control' && sharedMusicRef.current?.ownerUid === user.uid && ['play', 'pause', 'volume', 'stop'].includes(packet.action)) {
+            void applyMusicControl(packet.action, packet.value);
+          }
+        } catch { /* Ignore malformed control packets; no file data is sent here. */ }
+      });
+      room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
+        if (track.kind !== Track.Kind.Audio || roomRef.current !== room) return;
+        detachRemoteAudio(track);
+        if (publication.trackName === 'family-shared-music') {
+          setMusicState(sharedMusicRef.current || { title: 'Música compartilhada', ownerUid: participant.identity, ownerName: participant.name || 'Família', playing: true, volume: musicVolume });
+        }
+        const element = track.attach();
+        element.autoplay = true; element.controls = false; element.muted = false;
+        element.setAttribute('playsinline', ''); element.setAttribute('webkit-playsinline', 'true'); element.setAttribute('aria-hidden', 'true');
+        Object.assign(element.style, { position: 'fixed', width: '1px', height: '1px', left: '-2px', bottom: '-2px', opacity: '0', pointerEvents: 'none' });
+        document.body.appendChild(element);
+        remoteAudioElementsRef.current.set(track, element);
+        void element.play().then(() => {
+          if (roomRef.current === room) setAudioPlaybackBlocked(false);
+        }).catch(() => {
+          if (roomRef.current === room) setAudioPlaybackBlocked(true);
+        });
+      });
+      room.on(RoomEvent.TrackUnsubscribed, track => detachRemoteAudio(track));
+      room.on(RoomEvent.TrackSubscriptionFailed, () => {
+        if (roomRef.current === room) setError('O áudio de um familiar oscilou. O LiveKit está tentando recuperar a faixa; se não voltar, saia e entre na chamada novamente.');
+      });
+      room.on(RoomEvent.Disconnected, () => {
+        if (roomRef.current !== room) return;
+        roomRef.current = null; clearRemoteAudio(); disposeLocalMusic(); setMusicState(null); setCallState('idle'); setSpeakers([]); setCallParticipants(0); setCallQuality(ConnectionQuality.Unknown); setCallTarget(null);
+      });
+
       const idToken = await user.getIdToken();
       const response = await fetch(backendUrl('/api/livekit/token'), { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` }, body: JSON.stringify({ groupId: active, ...(recipientUid ? { recipientUid } : {}) }) });
       const payload = await response.json().catch(() => ({}));
@@ -434,26 +731,19 @@ export default function App() {
         throw new Error(payload.error || 'Não foi possível obter acesso à chamada.');
       }
       const { token, url } = payload;
-      const room = new Room({
-        adaptiveStream: true,
-        dynacast: true,
-        // Give Opus enough headroom for natural full-band speech while keeping
-        // the stream modest for cellular data. RED/DTX stay enabled for mobile
-        // packet loss and silence efficiency.
-        publishDefaults: { audioPreset: { maxBitrate: 64000 }, dtx: true, red: true },
-        // Aggressive voice isolation can make some phone microphones sound
-        // metallic. Keep the browser's echo/noise controls and automatic gain.
-        audioCaptureDefaults: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, voiceIsolation: false },
-      });
-      roomRef.current = room;
-      room.on(RoomEvent.ConnectionStateChanged, state => setCallState(state === 'connected' ? 'active' : state === 'reconnecting' ? 'reconnecting' : state === 'disconnected' ? 'idle' : 'connecting'));
-      room.on(RoomEvent.ActiveSpeakersChanged, activeSpeakers => setSpeakers(activeSpeakers.map(item => item.identity)));
-      room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => { if (track.kind === Track.Kind.Audio) { const element = track.attach(); element.autoplay = true; element.setAttribute('playsinline', ''); document.body.appendChild(element); setRemoteAudio(items => [...items, element]); } });
-      room.on(RoomEvent.Disconnected, () => { setCallState('idle'); roomRef.current = null; });
+      if (roomRef.current !== room) return;
       await room.connect(url, token, { autoSubscribe: true });
-      await room.localParticipant.setMicrophoneEnabled(true, { echoCancellation: true, noiseSuppression: true, autoGainControl: true, voiceIsolation: false });
-      setMuted(false); setCallState('active'); setCallMenu(false);
-    } catch (e) { setCallState('idle'); setError(e.name === 'NotAllowedError' ? 'Permita o acesso ao microfone para entrar na chamada.' : e.message); }
+      if (roomRef.current !== room) return;
+      try { await room.startAudio(); setAudioPlaybackBlocked(!room.canPlaybackAudio); }
+      catch { setAudioPlaybackBlocked(true); }
+      await room.localParticipant.setMicrophoneEnabled(true, audioCaptureDefaults);
+      if (roomRef.current !== room) return;
+      setMuted(false); setCallState('active'); setCallParticipants(room.remoteParticipants.size + 1); setCallMenu(false);
+    } catch (e) {
+      if (roomRef.current === room) roomRef.current = null;
+      room?.disconnect(); clearRemoteAudio(); disposeLocalMusic(); setMusicState(null); setCallState('idle'); setSpeakers([]); setCallParticipants(0); setCallQuality(ConnectionQuality.Unknown); setCallTarget(null);
+      setError(e.name === 'NotAllowedError' ? 'Permita o acesso ao microfone para entrar na chamada.' : e.message || 'A chamada não conseguiu conectar. Confira o sinal e tente novamente.');
+    }
   }
 
   async function toggleMute() {
@@ -464,8 +754,11 @@ export default function App() {
   }
 
   async function leaveCall() {
-    remoteAudio.forEach(element => { element.pause(); element.remove(); }); setRemoteAudio([]);
-    await roomRef.current?.disconnect(); roomRef.current = null; setCallState('idle'); setSpeakers([]); setCallTarget(null);
+    const room = roomRef.current;
+    await stopSharedMusic(true);
+    roomRef.current = null;
+    room?.disconnect(); clearRemoteAudio();
+    setCallState('idle'); setSpeakers([]); setCallParticipants(0); setCallQuality(ConnectionQuality.Unknown); setCallTarget(null); setMuted(false);
   }
 
   if (!authReady) return <div className="loading-screen"><div className="brand-mark">L</div><span>Preparando sua viagem…</span></div>;
@@ -478,6 +771,19 @@ export default function App() {
   const currentUserLocation = locations.find(item => item.uid === user.uid);
   const otherLocations = locations.filter(item => item.uid !== user.uid);
   const callLabel = callState === 'connecting' ? 'Conectando…' : callState === 'reconnecting' ? 'Reconectando…' : callState === 'active' ? 'Chamada ativa' : '';
+  const callQualityLabel = callQuality === ConnectionQuality.Excellent ? 'Sinal ótimo' : callQuality === ConnectionQuality.Good ? 'Sinal bom' : callQuality === ConnectionQuality.Poor ? 'Sinal fraco' : callQuality === ConnectionQuality.Lost ? 'Sem sinal' : 'Medindo sinal';
+
+  function chooseMusicFile(event) {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = '';
+    if (file) void startSharedMusic(file);
+  }
+
+  function requestMusicVolume(event) {
+    const next = Number(event.currentTarget.value);
+    setMusicVolume(next);
+    requestMusicControl('volume', next);
+  }
 
   return <main className="app-shell">
     <nav className="rail" aria-label="Navegação principal">
@@ -522,13 +828,35 @@ export default function App() {
       <div className="map-bottom"><span className="secure-note"><ShieldCheck size={15}/> Localização apenas com consentimento</span><span className="map-signal"><SignalHigh size={15}/> Atualização ao vivo</span></div></section>
 
     {error && <div className="toast" role="alert"><span>{error}</span><button onClick={() => setError('')} aria-label="Fechar"><X size={16}/></button></div>}
-    {callState !== 'idle' && <div className="call-dock" role="status"><span className={`call-wave ${callState}`}><Activity size={19}/></span><div className="call-info"><b>{callLabel}</b><span>{callTarget || group.name} · {speakers.length ? `${speakers.length} falando` : 'Conecte-se com a família'}</span></div><button className={`call-control ${muted ? 'is-muted' : ''}`} onClick={toggleMute} title={muted ? 'Ativar microfone' : 'Silenciar microfone'}>{muted ? <MicOff size={18}/> : <Mic size={18}/>}</button><button className="hangup" onClick={leaveCall} title="Sair da chamada"><Phone size={18}/></button></div>}
+    {callState !== 'idle' && <div className="call-dock" aria-label="Controles da chamada">
+      <div className="call-dock-main" role="status" aria-live="polite">
+        <span className={`call-wave ${callState}`}><Activity size={19}/></span>
+        <div className="call-info"><b>{callLabel}</b><span>{callTarget || group.name} · {speakers.length ? `${speakers.length} falando` : `${callParticipants} na chamada`}</span></div>
+        <span className={`call-quality ${callQuality}`} title={callQualityLabel}><SignalHigh size={15}/><span>{callQualityLabel}</span></span>
+        {audioPlaybackBlocked && <button className="unlock-audio" onClick={unlockCallAudio}><Volume2 size={15}/>Ativar áudio</button>}
+        <button className={`call-control ${muted ? 'is-muted' : ''}`} onClick={toggleMute} aria-label={muted ? 'Ativar microfone' : 'Silenciar microfone'} title={muted ? 'Ativar microfone' : 'Silenciar microfone'}>{muted ? <MicOff size={18}/> : <Mic size={18}/>}</button>
+        <button className="hangup" onClick={leaveCall} aria-label="Sair da chamada" title="Sair da chamada"><PhoneOff size={18}/></button>
+      </div>
+      <div className="call-music-row">
+        <input ref={musicFileInputRef} className="visually-hidden" type="file" accept="audio/mpeg,.mp3" onChange={chooseMusicFile} aria-label="Escolher arquivo MP3"/>
+        <button className="music-select-button" type="button" disabled={callState !== 'active' || Boolean(sharedMusic)} onClick={() => musicFileInputRef.current?.click()} title={sharedMusic ? 'Encerre a música atual para escolher outra' : 'Escolher um MP3 para todos na chamada'}>
+          <Music2 size={16}/><span>{sharedMusic ? 'Música compartilhada' : 'Compartilhar MP3'}</span>
+        </button>
+        {!sharedMusic && <span className="music-share-hint">Ao vivo para todos nesta chamada</span>}
+        {sharedMusic && <div className="music-shared-controls">
+          <span className="music-title"><b title={sharedMusic.title}>{sharedMusic.title}</b><small>{sharedMusic.ownerUid === user.uid ? 'Tocando para todos' : `${sharedMusic.ownerName || 'Família'} · para todos`} · {sharedMusic.playing ? 'reproduzindo' : 'pausada'}</small></span>
+          <button type="button" className="music-icon-button" onClick={() => requestMusicControl(sharedMusic.playing ? 'pause' : 'play')} aria-label={sharedMusic.playing ? 'Pausar para todos' : 'Reproduzir para todos'} title={sharedMusic.playing ? 'Pausar para todos' : 'Reproduzir para todos'}>{sharedMusic.playing ? <Pause size={16}/> : <Play size={16}/>}</button>
+          <label className="music-volume" title="Volume compartilhado"><Volume2 size={15}/><input type="range" min="0" max="1" step="0.05" value={musicVolume} onChange={requestMusicVolume} aria-label="Volume da música para todos"/></label>
+          <button type="button" className="music-icon-button music-stop" onClick={() => requestMusicControl('stop')} aria-label="Tirar música para todos" title="Tirar música para todos"><Trash2 size={15}/></button>
+        </div>}
+      </div>
+    </div>}
     <div className={`call-fab-wrap ${callState !== 'idle' ? 'in-call' : ''}`}>{callMenu && callState === 'idle' && <div className="call-menu"><b>Iniciar chamada de áudio</b><button onClick={() => { setCallTarget(null); startCall(); }}><Users size={15}/><span>Chamar grupo <small>{group.name}</small></span></button>{members.filter(member => member.id !== user.uid).map(member => <button key={member.id} onClick={() => { setCallTarget(member.displayName || 'Familiar'); startCall(member.id); }}><Phone size={14}/><span>{member.displayName || 'Familiar'} <small>Chamada individual</small></span></button>)}</div>}<span className="fab-hint">Ligue para o grupo</span><button className="call-fab" onClick={callState === 'idle' ? () => setCallMenu(!callMenu) : leaveCall} aria-label="Iniciar chamada de áudio"><Phone size={19} fill="currentColor"/></button></div>
     {activePanel && <div className="panel-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) setActivePanel(null); }}><section className="info-panel" role="dialog" aria-modal="true" aria-labelledby="info-panel-title"><button className="info-panel-close" onClick={() => setActivePanel(null)} aria-label="Fechar painel"><X size={18}/></button>
       {activePanel === 'groups' && <><span className="eyebrow">ESPAÇO DA FAMÍLIA</span><h2 id="info-panel-title">Seus grupos</h2><p>Escolha uma conversa. Cada grupo tem mensagens e chamada próprias.</p><div className="panel-group-list">{GROUPS.map(item => <button key={item.id} onClick={() => { setActive(item.id); setActivePanel(null); }}><span className="group-icon" style={{ '--group-color': item.color }}><item.icon size={16}/></span><span><b>{item.name}</b><small>{item.text}</small></span><ArrowRight size={15}/></button>)}</div><div className="panel-note"><LockKeyhole size={15}/> O servidor libera os grupos depois de validar a senha da família.</div></>}
       {activePanel === 'privacy' && <><span className="eyebrow">CONTROLES DA CONTA</span><h2 id="info-panel-title">Privacidade e localização</h2><p>Sua posição só é enviada enquanto você autoriza o compartilhamento. Você pode interromper quando quiser.</p><div className="panel-status"><span className={sharing ? 'status-dot on' : 'status-dot'}/><span>{sharing ? 'Compartilhamento ligado neste aparelho' : locationPermission === 'denied' ? 'Permissão do Safari bloqueada' : 'Sua posição não está sendo compartilhada por este aparelho'}</span></div><button className="panel-primary" onClick={() => { setActivePanel(null); toggleLocation(); }}>{sharing ? 'Parar de compartilhar' : 'Tentar compartilhar localização'}</button><div className="panel-note location-help"><MapPin size={15}/><span>No iPhone: Ajustes → Apps → Safari → Localização. Para este site, abra-o no Safari, toque em <b>aA → Ajustes do Site → Localização → Permitir</b>. Depois tente novamente. <a href="https://support.apple.com/en-euro/guide/iphone/iphb01fc3c85/27/ios/27" target="_blank" rel="noreferrer">Guia da Apple</a>.</span></div><div className="panel-note"><LockKeyhole size={15}/><span>Ao tocar em Sair ou fechar a página com conexão, o app pede ao servidor para apagar esta conta temporária, as mensagens dela e suas posições.</span></div><small className="panel-caption">A posição só aparece aos membros da família com acesso válido.</small></>}
       {activePanel === 'notifications' && <><span className="eyebrow">AVISOS</span><h2 id="info-panel-title">Notificações</h2><p>Notificações push ainda não foram configuradas neste projeto.</p><div className="panel-note"><Bell size={15}/> Para ativá-las é necessário configurar Firebase Cloud Messaging, a chave VAPID e o serviço de envio no backend.</div></>}
-      {activePanel === 'help' && <><span className="eyebrow">GUIA RÁPIDO</span><h2 id="info-panel-title">Como usar</h2><ul className="panel-help-list"><li><b>Grupos:</b> escolha uma conversa no painel lateral.</li><li><b>Localização:</b> toque em “Compartilhar minha posição” para iniciar e novamente para parar.</li><li><b>Áudio:</b> use o botão de telefone e escolha chamada em grupo ou individual.</li><li><b>Mapa:</b> o botão de pin centraliza as posições reais disponíveis.</li></ul><div className="panel-note"><ShieldCheck size={15}/> Se aparecer falta de permissão, a conta precisa ser associada aos grupos no Firebase.</div></>}
+      {activePanel === 'help' && <><span className="eyebrow">GUIA RÁPIDO</span><h2 id="info-panel-title">Como usar</h2><ul className="panel-help-list"><li><b>Grupos:</b> escolha uma conversa no painel lateral.</li><li><b>Localização:</b> toque em “Compartilhar minha posição” para iniciar e novamente para parar.</li><li><b>Chamadas:</b> use o botão de telefone e escolha uma chamada em grupo ou individual.</li><li><b>MP3:</b> durante uma chamada, toque em “Compartilhar MP3”. Play, pausa, volume e encerrar são sincronizados com quem está na chamada. O arquivo toca ao vivo e não é salvo no Firebase; quem compartilha precisa manter a chamada conectada.</li><li><b>Mapa:</b> o botão de pin centraliza as posições reais disponíveis.</li></ul><div className="panel-note"><ShieldCheck size={15}/> Se aparecer falta de permissão, a conta precisa ser associada aos grupos no Firebase.</div></>}
       {activePanel === 'trip' && <><span className="eyebrow">PLANEJAMENTO</span><h2 id="info-panel-title">Etapa do voo</h2><p>Os dados do voo ainda não foram cadastrados. Nenhum horário ou número foi inventado.</p><div className="panel-note"><Plane size={15}/> Quando os detalhes forem definidos, o administrador poderá adicioná-los à viagem.</div></>}
     </section></div>}
   </main>;

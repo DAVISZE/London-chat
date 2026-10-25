@@ -56,6 +56,54 @@
 .panel-help-list { display: grid; gap: 10px; padding-left: 18px; color: #b5b9c8; font-size: 11px; line-height: 1.6; }
 .panel-help-list b { color: #eceef5; }
 
+.call-dock { width: min(430px, calc(100vw - 36px)); flex-direction: column; align-items: stretch; gap: 9px; padding: 12px; border-color: #96a1ff2e; background: linear-gradient(145deg, #24283af5, #1c2030f5); box-shadow: 0 18px 52px #080a16a8, 0 0 0 1px #ffffff08 inset; }
+.call-dock-main { min-width: 0; display: flex; align-items: center; gap: 9px; }
+.call-wave { flex: none; width: 36px; height: 36px; border-radius: 11px; background: linear-gradient(145deg, #61dec02b, #6674ee24); box-shadow: 0 0 22px #61dec014; }
+.call-wave.active { animation: call-wave-glow 2.2s ease-in-out infinite; }
+.call-info { min-width: 0; }
+.call-info b { font-size: 11px; }
+.call-info span { font-size: 9px; }
+.call-quality { display: inline-flex; flex: none; align-items: center; gap: 4px; color: #aeb3c4; font-size: 8px; }
+.call-quality.excellent, .call-quality.good { color: #69ddbd; }
+.call-quality.poor { color: #f0bd72; }
+.call-quality.lost { color: #f17b87; }
+.unlock-audio { display: inline-flex; flex: none; align-items: center; gap: 4px; min-height: 32px; padding: 0 8px; border: 1px solid #e7bd7540; border-radius: 8px; background: #e7bd7515; color: #f2ca86; font-size: 9px; font-weight: 700; }
+.call-control, .hangup { flex: none; width: 36px; height: 36px; border-radius: 10px; }
+.hangup { transform: none; background: linear-gradient(145deg, #f06e7a, #d84f65); box-shadow: 0 6px 16px #e45c6b38; }
+.call-music-row { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; padding-top: 8px; border-top: 1px solid #ffffff0d; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.music-select-button { min-height: 35px; display: inline-flex; align-items: center; gap: 7px; padding: 0 10px; border: 1px solid #8f9cff35; border-radius: 9px; background: linear-gradient(120deg, #7180ff20, #b681f010); color: #c5cbff; font-size: 10px; font-weight: 700; transition: .16s ease; }
+.music-select-button:hover:not(:disabled) { border-color: #a6afff70; background: #7d89ff25; transform: translateY(-1px); }
+.music-select-button:disabled { cursor: default; opacity: .64; }
+.music-select-button svg { color: #a7b0ff; }
+.music-share-hint { color: #8f96aa; font-size: 8px; }
+.music-shared-controls { display: flex; flex: 1 1 100%; align-items: center; gap: 7px; min-width: 0; padding: 7px; border: 1px solid #61dec020; border-radius: 10px; background: linear-gradient(105deg, #61dec00e, #7481ee0d); }
+.music-title { display: flex; flex: 1; flex-direction: column; gap: 3px; min-width: 0; }
+.music-title b { overflow: hidden; color: #f1f2f8; font-size: 10px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.music-title small { overflow: hidden; color: #94a0a9; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.music-icon-button { display: grid; flex: none; place-items: center; width: 34px; height: 34px; border: 1px solid #ffffff14; border-radius: 10px; background: #ffffff0b; color: #d7dcff; }
+.music-icon-button:hover { background: #ffffff17; color: white; }
+.music-icon-button:first-of-type { border: 0; background: linear-gradient(145deg, #6e7df4, #7968dd); color: #fff; box-shadow: 0 5px 13px #6c70e83b; }
+.music-icon-button.music-stop { width: 32px; height: 32px; color: #f0949d; }
+.music-volume { display: flex; align-items: center; gap: 5px; color: #aab1c0; }
+.music-volume input { width: 78px; height: 22px; accent-color: #69dcbf; }
+@keyframes call-wave-glow { 50% { box-shadow: 0 0 0 5px #61dec010, 0 0 24px #61dec02a; } }
+@media (max-width: 760px) {
+  .call-dock { right: 10px; bottom: calc(112px + env(safe-area-inset-bottom)); width: min(430px, calc(100% - 20px)); padding: 10px; }
+  .call-quality span { display: none; }
+  .call-dock-main { gap: 7px; }
+  .call-wave { width: 33px; height: 33px; }
+  .music-volume input { width: clamp(62px, 20vw, 86px); }
+}
+@media (max-width: 360px) {
+  .call-quality { display: none; }
+  .music-shared-controls { gap: 5px; padding: 6px; }
+  .music-volume input { width: 55px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .call-wave.active, .call-wave.connecting, .call-wave.reconnecting { animation: none; }
+}
+
 @media (max-width: 760px) {
   .info-panel { padding: 24px 20px; }
   html, body, #root { width: 100%; min-height: 100%; overscroll-behavior: none; }
