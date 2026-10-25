@@ -4,6 +4,9 @@
 .wake-lock-indicator.active { color: #61dec0; }
 .wake-lock-indicator.requesting, .wake-lock-indicator.inactive { color: #858a9e; }
 .wake-lock-indicator.unsupported { color: #d5ae73; }
+.mobile-location-action { display: none; }
+.mobile-nav-label { display: none; }
+.location-consent.denied { color: #e7a2a2; }
 .leaflet-tile-pane { filter: invert(.86) hue-rotate(180deg) brightness(.72) saturate(.7) contrast(1.08); }
 .map-attribution a { color: inherit; text-decoration: underline dotted; text-underline-offset: 2px; }
 .trip-strip, .journey-card { width: 100%; color: inherit; text-align: left; cursor: pointer; }
@@ -21,6 +24,8 @@
 .panel-group-list small,.panel-caption { color: #8f95a9; font-size: 10px; }
 .panel-note { display: flex; align-items: flex-start; gap: 9px; margin-top: 16px; padding: 12px; border: 1px solid #ffffff0d; border-radius: 10px; background: #ffffff05; color: #a5aabc; font-size: 11px; line-height: 1.55; }
 .panel-note svg { flex: none; color: #8c96fa; }
+.location-help { margin-top: 10px; }
+.location-help a { color: #aab2ff; text-underline-offset: 2px; }
 .panel-status { display: flex; align-items: center; gap: 9px; margin: 20px 0; color: #c4c8d5; font-size: 11px; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #777d91; }
 .status-dot.on { background: #61dec0; box-shadow: 0 0 0 4px #61dec020; }
@@ -43,6 +48,9 @@
   }
   .rail-icon { width: 44px; height: 44px; min-width: 44px; min-height: 44px; }
   .rail-icon.wake-lock-indicator { display: grid; place-items: center; }
+  .rail-icon.mobile-location-action { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; }
+  .rail-icon.mobile-location-action.selected { color: #61dec0; }
+  .mobile-location-action .mobile-nav-label { display: block; font-size: 7px; font-weight: 700; line-height: 9px; }
   .sidebar {
     bottom: calc(64px + env(safe-area-inset-bottom));
     height: min(72dvh, 590px);
@@ -72,8 +80,8 @@
   .vehicle-card, .journey-card, .chat-card { padding: 12px; }
   .vehicle-row { height: 50px; }
   .location-button { height: 44px; font-size: 12px; }
-.location-consent.locating { color: #f1c77b; }
-.location-consent.locating svg { animation: location-search-pulse 1.2s ease-in-out infinite; }
+  .location-consent.locating { color: #f1c77b; }
+  .location-consent.locating svg { animation: location-search-pulse 1.2s ease-in-out infinite; }
 @keyframes location-search-pulse { 50% { opacity: .35; transform: scale(.88); } }
   .location-options select { min-height: 38px; font-size: 14px; }
   .sidebar .chat-card { min-height: 205px; flex: 1 0 205px; }

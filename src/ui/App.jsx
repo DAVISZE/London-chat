@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { inMemoryPersistence, onAuthStateChanged, setPersistence, signInAnonymously, signOut, updateProfile } from 'firebase/auth';
-import { addDoc, collection, doc, limit, onSnapshot, query, serverTimestamp, setDoc, where } from 'firebase/firestore';
+import { addDoc, collection, doc, limit, onSnapshot, query, serverTimestamp, where, writeBatch } from 'firebase/firestore';
 import { Room, RoomEvent, Track } from 'livekit-client';
 import { Activity, ArrowRight, Bell, CarFront, Check, ChevronDown, CircleHelp, Compass, Crosshair, Eye, EyeOff, Forward, LogIn, LogOut, LockKeyhole, MapPin, Menu, MessageCircle, Mic, MicOff, Navigation, Phone, Plane, Send, ShieldCheck, SignalHigh, Sun, Users, X } from 'lucide-react';
 import { auth, db, firebaseConfigured } from '../firebase.js';
@@ -32,7 +32,9 @@ function isFresh(value) {
 }
 
 function firestoreMessage(error, feature) {
-  if (error?.code === 'permission-denied') return `O Firebase bloqueou ${feature}. Entre com a senha da família novamente após reiniciar o backend; se continuar, publique as regras de firestore.rules.`;
+  if (error?.code === 'permission-denied') return feature.includes('localização')
+    ? 'O GPS encontrou sua posição, mas o Firestore recusou salvá-la. Saia e entre novamente com a senha da família para renovar a sessão; as regras ativas já foram conferidas.'
+    : `O Firebase bloqueou ${feature}. Entre com a senha da família novamente após reiniciar o backend; se continuar, publique as regras de firestore.rules.`;
   if (error?.code === 'unavailable' || error?.code === 'deadline-exceeded') return 'Conexão com o Firebase instável. Verifique a internet e tente novamente.';
   return `Não foi possível carregar ${feature}. Tente novamente em instantes.`;
 }
@@ -53,6 +55,7 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const [sharing, setSharing] = useState(false);
   const [locationStatus, setLocationStatus] = useState('idle');
+  const [locationPermission, setLocationPermission] = useState('unknown');
   const [callState, setCallState] = useState('idle');
   const [callMenu, setCallMenu] = useState(false);
   const [callTarget, setCallTarget] = useState(null);
@@ -68,6 +71,9 @@ export default function App() {
   const [activePanel, setActivePanel] = useState(null);
   const roomRef = useRef(null);
   const watchRef = useRef(null);
+  const locationRequestRef = useRef(0);
+  const locationWriteRef = useRef(false);
+  const lastLocationWriteRef = useRef(0);
   const messageEndRef = useRef(null);
   const group = useMemo(() => GROUPS.find(item => item.id === active) || GROUPS[0], [active]);
 
@@ -135,6 +141,22 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let permissionStatus;
+    let disposed = false;
+    const updatePermission = () => { if (!disposed && permissionStatus) setLocationPermission(permissionStatus.state); };
+    navigator.permissions?.query?.({ name: 'geolocation' })?.then(status => {
+        if (disposed) return;
+        permissionStatus = status;
+        updatePermission();
+        status.addEventListener?.('change', updatePermission);
+      })?.catch(() => {}); // Safari may not expose the Permissions API; geolocation still works.
+    return () => {
+      disposed = true;
+      permissionStatus?.removeEventListener?.('change', updatePermission);
+    };
+  }, []);
+
   useEffect(() => { if (!user) { setFamilyAccess('locked'); setFamilyName(''); } }, [user]);
 
   useEffect(() => {
@@ -147,7 +169,10 @@ export default function App() {
 
   useEffect(() => {
     if (familyAccess === 'unlocked') return;
-    if (watchRef.current !== null) { navigator.geolocation?.clearWatch(watchRef.current); watchRef.current = null; setSharing(false); setLocationStatus('idle'); }
+    // Invalidate a pending one-shot GPS request when the family session ends.
+    locationRequestRef.current += 1;
+    if (watchRef.current !== null) navigator.geolocation?.clearWatch(watchRef.current);
+    watchRef.current = null; setSharing(false); setLocationStatus('idle');
     if (roomRef.current) { roomRef.current.disconnect(); roomRef.current = null; setCallState('idle'); }
   }, [familyAccess]);
 
@@ -173,7 +198,7 @@ export default function App() {
   }, [activePanel]);
 
   useEffect(() => { messageEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, [messages]);
-  useEffect(() => () => { if (watchRef.current !== null) navigator.geolocation?.clearWatch(watchRef.current); roomRef.current?.disconnect(); }, []);
+  useEffect(() => () => { locationRequestRef.current += 1; if (watchRef.current !== null) navigator.geolocation?.clearWatch(watchRef.current); roomRef.current?.disconnect(); }, []);
 
   async function authenticate(event) {
     event.preventDefault(); setError('');
@@ -265,34 +290,68 @@ export default function App() {
 
   async function toggleLocation() {
     if (!navigator.geolocation) { setError('Este dispositivo não oferece geolocalização.'); return; }
-    if (sharing) { navigator.geolocation.clearWatch(watchRef.current); watchRef.current = null; setSharing(false); setLocationStatus('idle'); return; }
+    if (sharing) {
+      locationRequestRef.current += 1;
+      if (watchRef.current !== null) navigator.geolocation.clearWatch(watchRef.current);
+      watchRef.current = null; setSharing(false); setLocationStatus('idle'); return;
+    }
     if (!user) return;
     setError('');
     if (!window.isSecureContext) { setError('A localização exige uma conexão segura (HTTPS). Abra o endereço publicado do site.'); return; }
-    try {
-      setLocationStatus('locating');
-      watchRef.current = navigator.geolocation.watchPosition(async position => {
-        const { latitude, longitude, accuracy, speed } = position.coords;
-        try {
-          const location = { uid: user.uid, displayName: familyName || user.displayName || 'Família', latitude, longitude, accuracy, speed, ...(vehicleRole !== 'pessoa' ? { vehicle: vehicleRole } : {}), updatedAt: serverTimestamp(), online: true };
-          await Promise.all(GROUPS.map(item => setDoc(doc(db, 'groups', item.id, 'locations', user.uid), location, { merge: true })));
-          setLocationStatus('sharing');
-        } catch (e) {
-          setError(e?.code === 'permission-denied' ? firestoreMessage(e, 'compartilhar localização neste grupo') : 'O GPS encontrou sua posição, mas não foi possível salvá-la. Verifique sua conexão e tente novamente.');
+    const requestId = ++locationRequestRef.current;
+    const options = { enableHighAccuracy: true, maximumAge: 5000, timeout: 30000 };
+    const stopLocationAfterError = e => {
+      if (requestId !== locationRequestRef.current) return;
+      if (watchRef.current !== null) navigator.geolocation.clearWatch(watchRef.current);
+      watchRef.current = null;
+      const message = e.code === 1
+        ? 'O iPhone/Safari bloqueou o GPS. Abra o site no Safari e permita Localização em Ajustes do Site (aA). Confira também Ajustes → Privacidade e Segurança → Serviços de Localização.'
+        : e.code === 2
+          ? 'O GPS não conseguiu uma posição. Ative Serviços de Localização e Localização Precisa para o Safari; tente novamente perto de uma janela ou ao ar livre.'
+          : 'A busca do GPS demorou demais. Confira o sinal, deixe o site aberto e toque para tentar novamente.';
+      if (e.code === 1) setLocationPermission('denied');
+      setError(message); setSharing(false); setLocationStatus(e.code === 1 ? 'denied' : 'idle');
+    };
+    const saveLocation = async position => {
+      if (requestId !== locationRequestRef.current || locationWriteRef.current) return false;
+      // iOS may report several quick fixes. Avoid overlapping writes and
+      // keep mobile data usage low while retaining a live position.
+      if (Date.now() - lastLocationWriteRef.current < 4000) return true;
+      locationWriteRef.current = true;
+      const { latitude, longitude, accuracy, speed } = position.coords;
+      try {
+        const location = { uid: user.uid, displayName: familyName || user.displayName || 'Família', latitude, longitude, accuracy, speed, ...(vehicleRole !== 'pessoa' ? { vehicle: vehicleRole } : {}), updatedAt: serverTimestamp(), online: true };
+        const batch = writeBatch(db);
+        GROUPS.forEach(item => batch.set(doc(db, 'groups', item.id, 'locations', user.uid), location, { merge: true }));
+        await batch.commit();
+        if (requestId !== locationRequestRef.current) return false;
+        lastLocationWriteRef.current = Date.now();
+        setLocationPermission('granted'); setLocationStatus('sharing');
+        return true;
+      } catch (e) {
+        if (requestId === locationRequestRef.current) {
+          setError(e?.code === 'permission-denied' ? firestoreMessage(e, 'compartilhar localização neste grupo') : 'O GPS encontrou sua posição, mas não foi possível salvá-la no Firebase. Confira a internet e tente novamente.');
           if (watchRef.current !== null) navigator.geolocation.clearWatch(watchRef.current);
           watchRef.current = null; setSharing(false); setLocationStatus('idle');
         }
-      }, e => {
-        if (watchRef.current !== null) navigator.geolocation.clearWatch(watchRef.current);
-        const message = e.code === 1
-          ? 'O iPhone bloqueou a localização. Em Ajustes, permita localização para Safari e para este site; depois tente novamente.'
-          : e.code === 2
-            ? 'O iPhone não conseguiu localizar o GPS. Ative Serviços de Localização, confira o sinal e tente perto de uma janela ou ao ar livre.'
-            : 'A busca do GPS demorou demais. Deixe o site aberto, confira o sinal e toque para tentar de novo.';
-        setError(message); setSharing(false); setLocationStatus('idle'); watchRef.current = null;
-      }, { enableHighAccuracy: true, maximumAge: 0, timeout: 45000 });
+        return false;
+      } finally { locationWriteRef.current = false; }
+    };
+    try {
+      setLocationStatus('locating');
       setSharing(true);
-    } catch { setLocationStatus('idle'); setError('Não foi possível iniciar o GPS. Confira a permissão de localização do navegador e tente novamente.'); }
+      // A one-shot request makes iOS show its permission prompt immediately.
+      // Start continuous updates only after the first real fix was saved.
+      navigator.geolocation.getCurrentPosition(async position => {
+        if (requestId !== locationRequestRef.current) return;
+        const saved = await saveLocation(position);
+        if (!saved || requestId !== locationRequestRef.current) return;
+        watchRef.current = navigator.geolocation.watchPosition(saveLocation, stopLocationAfterError, { ...options, timeout: 45000 });
+      }, stopLocationAfterError, options);
+    } catch {
+      locationRequestRef.current += 1;
+      setSharing(false); setLocationStatus('idle'); setError('Não foi possível iniciar o GPS. Abra o site no Safari, confira a permissão de localização e tente novamente.');
+    }
   }
 
   async function startCall(recipientUid = null) {
@@ -360,6 +419,7 @@ export default function App() {
       <button className="rail-icon selected" title="Mapa" aria-label="Mapa" onClick={() => { setMenuOpen(false); window.dispatchEvent(new Event('map-recenter')); }}><MapPin size={19} /></button>
       <button className="rail-icon" title="Grupos e controles" onClick={() => window.matchMedia('(max-width: 760px)').matches ? setMenuOpen(true) : setActivePanel('groups')} aria-label="Abrir grupos, conversas e localização"><Users size={18} /></button>
       <button className="rail-icon" title="Conversas" onClick={() => { setMenuOpen(true); window.setTimeout(() => document.querySelector('.chat-card')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 280); }} aria-label="Conversas"><MessageCircle size={18} /></button>
+      <button type="button" className={`rail-icon mobile-location-action ${sharing ? 'selected' : ''}`} title={sharing ? 'Parar compartilhamento de localização' : 'Compartilhar localização'} aria-label={sharing ? 'Parar compartilhamento de localização' : 'Compartilhar localização'} onClick={() => { toggleLocation(); setMenuOpen(true); window.setTimeout(() => document.querySelector('.vehicle-card')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 280); }}><Crosshair size={18} /><span className="mobile-nav-label">{sharing ? 'Parar' : 'GPS'}</span></button>
       <div className="rail-spacer" />
       <button className="rail-icon" title="Privacidade" aria-label="Privacidade" onClick={() => setActivePanel('privacy')}><ShieldCheck size={18} /></button>
       <button type="button" className={`rail-icon wake-lock-indicator ${wakeLockStatus}`} onClick={() => window.dispatchEvent(new Event('lft:request-screen-wake-lock'))} aria-label={wakeLockStatus === 'active' ? 'Tela mantida ativa. Toque para tentar novamente' : wakeLockStatus === 'unsupported' ? 'Este navegador não oferece bloqueio de tela' : 'Toque para tentar manter a tela ativa'} title={wakeLockStatus === 'active' ? 'Tela mantida ativa enquanto o site estiver visível' : wakeLockStatus === 'unsupported' ? 'Bloqueio de tela não suportado neste navegador' : wakeLockStatus === 'requesting' ? 'Tentando manter a tela ativa' : 'Toque para tentar manter a tela ativa'}><Sun size={18} /></button>
@@ -378,7 +438,7 @@ export default function App() {
 
       <section className="vehicle-card"><div className="card-title"><span>NO MAPA</span><span className="live-label"><i/> AO VIVO</span></div>
         {[{ name: 'Carro 1', subtitle: 'Localização autorizada', color: '#64ddc0', car: locations.find(v => v.vehicle === 'carro-1') }, { name: 'Carro 2', subtitle: 'Localização autorizada', color: '#82a1ff', car: locations.find(v => v.vehicle === 'carro-2') }].map(vehicle => <div className="vehicle-row" key={vehicle.name}><span className="car-icon" style={{ color: vehicle.color }}><CarFront size={19}/></span><div className="vehicle-info"><b>{vehicle.name}</b><span>{vehicle.car ? `Atualizado ${timeLabel(vehicle.car.updatedAt)}` : vehicle.subtitle}</span></div><span className={`vehicle-status ${isFresh(vehicle.car?.updatedAt) ? 'online' : ''}`}>{isFresh(vehicle.car?.updatedAt) ? <><i/> Conectado</> : vehicle.car ? 'Último sinal' : 'Sem sinal'}</span></div>)}
-        <div className={`location-consent ${locationStatus}`}><MapPin size={13}/><span>{locationStatus === 'locating' ? 'Buscando sinal do GPS… mantenha o site aberto.' : currentUserLocation ? `Sua posição atualizada às ${timeLabel(currentUserLocation.updatedAt)}` : 'Localização compartilhada só com sua autorização.'}</span></div>
+        <div className={`location-consent ${locationStatus}`}><MapPin size={13}/><span>{locationStatus === 'locating' ? 'Buscando sinal do GPS… mantenha o site aberto.' : locationPermission === 'denied' ? 'Permissão bloqueada no iPhone. Toque no botão de localização para ver como liberar.' : currentUserLocation ? `Sua posição atualizada às ${timeLabel(currentUserLocation.updatedAt)}` : 'Localização compartilhada só com sua autorização.'}</span></div>
         <div className="location-options"><span>Compartilhar como</span><select value={vehicleRole} onChange={e => setVehicleRole(e.target.value)} aria-label="Tipo de localização"><option value="pessoa">Pessoa</option><option value="carro-1">Carro 1</option><option value="carro-2">Carro 2</option></select></div><button className={`location-button ${sharing ? 'sharing' : ''}`} onClick={toggleLocation} aria-live="polite"><Crosshair size={15}/>{locationStatus === 'locating' ? 'Buscando localização… toque para parar' : sharing ? 'Parar de compartilhar' : 'Compartilhar minha posição'}</button>
       </section>
 
@@ -400,7 +460,7 @@ export default function App() {
     <div className={`call-fab-wrap ${callState !== 'idle' ? 'in-call' : ''}`}>{callMenu && callState === 'idle' && <div className="call-menu"><b>Iniciar chamada de áudio</b><button onClick={() => { setCallTarget(null); startCall(); }}><Users size={15}/><span>Chamar grupo <small>{group.name}</small></span></button>{members.filter(member => member.id !== user.uid).map(member => <button key={member.id} onClick={() => { setCallTarget(member.displayName || 'Familiar'); startCall(member.id); }}><Phone size={14}/><span>{member.displayName || 'Familiar'} <small>Chamada individual</small></span></button>)}</div>}<span className="fab-hint">Ligue para o grupo</span><button className="call-fab" onClick={callState === 'idle' ? () => setCallMenu(!callMenu) : leaveCall} aria-label="Iniciar chamada de áudio"><Phone size={19} fill="currentColor"/></button></div>
     {activePanel && <div className="panel-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) setActivePanel(null); }}><section className="info-panel" role="dialog" aria-modal="true" aria-labelledby="info-panel-title"><button className="info-panel-close" onClick={() => setActivePanel(null)} aria-label="Fechar painel"><X size={18}/></button>
       {activePanel === 'groups' && <><span className="eyebrow">ESPAÇO DA FAMÍLIA</span><h2 id="info-panel-title">Seus grupos</h2><p>Escolha uma conversa. Cada grupo tem mensagens e chamada próprias.</p><div className="panel-group-list">{GROUPS.map(item => <button key={item.id} onClick={() => { setActive(item.id); setActivePanel(null); }}><span className="group-icon" style={{ '--group-color': item.color }}><item.icon size={16}/></span><span><b>{item.name}</b><small>{item.text}</small></span><ArrowRight size={15}/></button>)}</div><div className="panel-note"><LockKeyhole size={15}/> O servidor libera os grupos depois de validar a senha da família.</div></>}
-      {activePanel === 'privacy' && <><span className="eyebrow">CONTROLES DA CONTA</span><h2 id="info-panel-title">Privacidade e localização</h2><p>Sua posição só é enviada enquanto você autoriza o compartilhamento. Você pode interromper quando quiser.</p><div className="panel-status"><span className={sharing ? 'status-dot on' : 'status-dot'}/><span>{sharing ? 'Compartilhamento ligado neste aparelho' : 'Sua posição não está sendo compartilhada por este aparelho'}</span></div><button className="panel-primary" onClick={() => { setActivePanel(null); toggleLocation(); }}>{sharing ? 'Parar de compartilhar' : 'Compartilhar minha posição'}</button><small className="panel-caption">A localização de outras pessoas só aparece com permissão e acesso ao grupo.</small></>}
+      {activePanel === 'privacy' && <><span className="eyebrow">CONTROLES DA CONTA</span><h2 id="info-panel-title">Privacidade e localização</h2><p>Sua posição só é enviada enquanto você autoriza o compartilhamento. Você pode interromper quando quiser.</p><div className="panel-status"><span className={sharing ? 'status-dot on' : 'status-dot'}/><span>{sharing ? 'Compartilhamento ligado neste aparelho' : locationPermission === 'denied' ? 'Permissão do Safari bloqueada' : 'Sua posição não está sendo compartilhada por este aparelho'}</span></div><button className="panel-primary" onClick={() => { setActivePanel(null); toggleLocation(); }}>{sharing ? 'Parar de compartilhar' : 'Tentar compartilhar localização'}</button><div className="panel-note location-help"><MapPin size={15}/><span>No iPhone: Ajustes → Apps → Safari → Localização. Para este site, abra-o no Safari, toque em <b>aA → Ajustes do Site → Localização → Permitir</b>. Depois tente novamente. <a href="https://support.apple.com/en-euro/guide/iphone/iphb01fc3c85/27/ios/27" target="_blank" rel="noreferrer">Guia da Apple</a>.</span></div><small className="panel-caption">A posição só aparece aos membros da família com acesso válido.</small></>}
       {activePanel === 'notifications' && <><span className="eyebrow">AVISOS</span><h2 id="info-panel-title">Notificações</h2><p>Notificações push ainda não foram configuradas neste projeto.</p><div className="panel-note"><Bell size={15}/> Para ativá-las é necessário configurar Firebase Cloud Messaging, a chave VAPID e o serviço de envio no backend.</div></>}
       {activePanel === 'help' && <><span className="eyebrow">GUIA RÁPIDO</span><h2 id="info-panel-title">Como usar</h2><ul className="panel-help-list"><li><b>Grupos:</b> escolha uma conversa no painel lateral.</li><li><b>Localização:</b> toque em “Compartilhar minha posição” para iniciar e novamente para parar.</li><li><b>Áudio:</b> use o botão de telefone e escolha chamada em grupo ou individual.</li><li><b>Mapa:</b> o botão de pin centraliza as posições reais disponíveis.</li></ul><div className="panel-note"><ShieldCheck size={15}/> Se aparecer falta de permissão, a conta precisa ser associada aos grupos no Firebase.</div></>}
       {activePanel === 'trip' && <><span className="eyebrow">PLANEJAMENTO</span><h2 id="info-panel-title">Etapa do voo</h2><p>Os dados do voo ainda não foram cadastrados. Nenhum horário ou número foi inventado.</p><div className="panel-note"><Plane size={15}/> Quando os detalhes forem definidos, o administrador poderá adicioná-los à viagem.</div></>}
