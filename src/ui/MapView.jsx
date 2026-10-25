@@ -17,17 +17,18 @@ export default function MapView({ locations, currentUid, focusedUid = '' }) {
   const mapRef = useRef(null);
   const markersRef = useRef(new Map());
   const didFitRef = useRef(false);
+  const focusedUidRef = useRef('');
 
   useEffect(() => {
     if (!nodeRef.current || mapRef.current) return;
-    const map = L.map(nodeRef.current, { zoomControl: false, attributionControl: false, minZoom: 3 }).setView([51.5077, -0.1278], 12);
-    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap contributors' }).addTo(map);
+    const map = L.map(nodeRef.current, { zoomControl: false, attributionControl: false, minZoom: 3, zoomAnimation: true, fadeAnimation: false, preferCanvas: true }).setView([51.5077, -0.1278], 12);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, keepBuffer: 3, updateWhenZooming: false, attribution: '© OpenStreetMap contributors' }).addTo(map);
     L.control.zoom({ position: 'bottomright' }).addTo(map);
     mapRef.current = map;
     const recenter = () => {
       const points = [...markersRef.current.values()].map(marker => marker.getLatLng());
-      if (points.length === 1) map.setView(points[0], 14, { animate: true });
-      else if (points.length > 1) map.fitBounds(L.latLngBounds(points).pad(0.25), { maxZoom: 14, animate: true });
+      if (points.length === 1) map.flyTo(points[0], Math.max(map.getZoom(), 14), { animate: true, duration: 0.32 });
+      else if (points.length > 1) map.fitBounds(L.latLngBounds(points).pad(0.25), { maxZoom: 14, animate: true, duration: 0.32 });
     };
     window.addEventListener('map-recenter', recenter);
     const resize = new ResizeObserver(() => map.invalidateSize()); resize.observe(nodeRef.current);
@@ -59,17 +60,18 @@ export default function MapView({ locations, currentUid, focusedUid = '' }) {
 
   useEffect(() => {
     const map = mapRef.current;
+    focusedUidRef.current = focusedUid;
     const marker = focusedUid ? markersRef.current.get(focusedUid) : null;
     if (!map || !marker) return;
-    map.flyTo(marker.getLatLng(), Math.max(map.getZoom(), 15), { animate: true, duration: 0.65 });
+    map.flyTo(marker.getLatLng(), Math.max(map.getZoom(), 15), { animate: true, duration: 0.32 });
     marker.openPopup();
   }, [focusedUid]);
 
   useEffect(() => {
-    if (!focusedUid) return;
-    const marker = mapRef.current && markersRef.current.get(focusedUid);
-    if (marker) mapRef.current.panTo(marker.getLatLng(), { animate: true, duration: 0.4 });
-  }, [locations, focusedUid]);
+    const map = mapRef.current;
+    const marker = focusedUidRef.current && markersRef.current.get(focusedUidRef.current);
+    if (map && marker) map.panTo(marker.getLatLng(), { animate: true, duration: 0.22 });
+  }, [locations]);
 
   return <div className="map" ref={nodeRef} aria-label="Mapa de Londres e localizações autorizadas"/>;
 }

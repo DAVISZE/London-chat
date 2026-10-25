@@ -49,22 +49,27 @@ function firestoreMessage(error, feature) {
   return `Não foi possível carregar ${feature}. Tente novamente em instantes.`;
 }
 
-function MapFocusControl({ locations, currentUid, focusedUid, onFocus }) {
+function MapFocusControl({ locations, currentUid, focusedUid, onFocus, onLocateAll }) {
   const [open, setOpen] = useState(false);
   const candidates = locations.filter(location => Number.isFinite(location.latitude) && Number.isFinite(location.longitude));
   const focused = candidates.find(location => location.uid === focusedUid);
   const labelFor = location => location.uid === currentUid ? `Você · ${location.displayName || 'este aparelho'}` : location.displayName || (location.vehicle ? location.vehicle.replace('-', ' ') : 'Familiar');
 
   return <div className="map-focus-control">
-    <button type="button" className="map-focus-button" onClick={() => setOpen(value => !value)} aria-expanded={open} aria-haspopup="listbox" disabled={!candidates.length}>
+    <button type="button" className="map-focus-button" onClick={() => setOpen(value => !value)} aria-expanded={open} aria-haspopup="listbox">
       <Crosshair size={15}/><span>Focar em:</span><b>{focused ? labelFor(focused) : 'Escolher pessoa'}</b><ChevronDown size={13}/>
     </button>
     {open && <div className="map-focus-menu" role="listbox" aria-label="Pessoas com localização no mapa">
-      {candidates.length ? candidates.map(location => <button type="button" role="option" aria-selected={focusedUid === location.uid} key={location.uid} onClick={() => { onFocus(location.uid); setOpen(false); }}>
+      <button type="button" role="option" aria-selected="false" className="focus-all-option" disabled={!candidates.length} onClick={() => { onLocateAll(); setOpen(false); }}>
+        <span className="focus-avatar focus-all-avatar"><Users size={15}/></span>
+        <span className="focus-person"><b>Localizar todos</b><small>{candidates.length ? `${candidates.length} ${candidates.length === 1 ? 'posição real disponível' : 'posições reais disponíveis'}` : 'Ninguém compartilhando agora'}</small></span>
+        <Navigation size={15}/>
+      </button>
+      {candidates.map(location => <button type="button" role="option" aria-selected={focusedUid === location.uid} key={location.uid} onClick={() => { onFocus(location.uid); setOpen(false); }}>
         <span className={`focus-avatar ${location.vehicle || (location.uid === currentUid ? 'self' : '')}`}>{location.vehicle ? <CarFront size={14}/> : (location.displayName || '?').slice(0, 1).toUpperCase()}</span>
         <span className="focus-person"><b>{labelFor(location)}</b><small>{location.vehicle ? 'Localização do carro' : 'Localização compartilhada'}</small></span>
         {focusedUid === location.uid && <Check size={15}/>}
-      </button>) : <p>Ninguém está compartilhando localização agora.</p>}
+      </button>)}
     </div>}
   </div>;
 }
@@ -513,7 +518,7 @@ export default function App() {
     </aside>
 
       <section className="map-area"><div className="map-topbar"><div className="map-title"><span className="map-live"><i/></span><div><b>O mapa da nossa viagem</b><span>{locations.length} {locations.length === 1 ? 'pessoa compartilhando localização' : 'localizações compartilhadas'}</span></div></div><div className="map-top-actions"><div className="member-stack">{members.slice(0, 4).map((member, i) => <span key={member.id} title={member.displayName || 'Membro'} style={{ '--avatar-color': ['#eeb39c', '#b8a5ed', '#83cdb7', '#f0cb85'][i % 4] }}>{(member.displayName || '?')[0].toUpperCase()}</span>)}{members.length === 0 && <span className="stack-empty"><Users size={14}/></span>}</div><button className="map-action" aria-label="Notificações" onClick={() => setActivePanel('notifications')}><Bell size={17}/><i/></button><button className="map-action" aria-label="Ajuda" onClick={() => setActivePanel('help')}><CircleHelp size={17}/></button></div></div>
-      <div className="map-wrap"><MapView locations={locations} currentUid={user.uid} focusedUid={focusedUid}/><MapFocusControl locations={locations} currentUid={user.uid} focusedUid={focusedUid} onFocus={setFocusedUid}/><div className="map-label"><span className="map-label-pin"><Compass size={16}/></span><div><b>Área de viagem</b><span>Londres e arredores</span></div><span className="label-chevron">⌄</span></div><div className="map-legend"><span><i className="legend-dot me"/> Você</span><span><i className="legend-dot car1"/> Carro 1</span><span><i className="legend-dot car2"/> Carro 2</span></div><div className="map-attribution">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a></div><button className="recenter" onClick={() => window.dispatchEvent(new Event('map-recenter'))} title="Centralizar localizações" aria-label="Centralizar mapa"><Navigation size={18}/></button></div>
+      <div className="map-wrap"><MapView locations={locations} currentUid={user.uid} focusedUid={focusedUid}/><MapFocusControl locations={locations} currentUid={user.uid} focusedUid={focusedUid} onFocus={setFocusedUid} onLocateAll={() => { setFocusedUid(''); window.dispatchEvent(new Event('map-recenter')); }}/><div className="map-label"><span className="map-label-pin"><Compass size={16}/></span><div><b>Área de viagem</b><span>Londres e arredores</span></div><span className="label-chevron">⌄</span></div><div className="map-legend"><span><i className="legend-dot me"/> Você</span><span><i className="legend-dot car1"/> Carro 1</span><span><i className="legend-dot car2"/> Carro 2</span></div><div className="map-attribution">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a></div><button className="recenter" onClick={() => window.dispatchEvent(new Event('map-recenter'))} title="Centralizar localizações" aria-label="Centralizar mapa"><Navigation size={18}/></button></div>
       <div className="map-bottom"><span className="secure-note"><ShieldCheck size={15}/> Localização apenas com consentimento</span><span className="map-signal"><SignalHigh size={15}/> Atualização ao vivo</span></div></section>
 
     {error && <div className="toast" role="alert"><span>{error}</span><button onClick={() => setError('')} aria-label="Fechar"><X size={16}/></button></div>}
